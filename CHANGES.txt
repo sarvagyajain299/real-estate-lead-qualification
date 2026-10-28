@@ -1,0 +1,418 @@
+Version: v1.3.0
+Date: 2026-08-29
+Type: New functionality + bug fixes (one of them serious)
+
+WHY
+
+A live Telegram conversation at 15:29-15:43 on 2026-08-29, running v1.1.1, went wrong in
+two separate ways.
+
+It did not converse. The lead opened with a bare "Hi" and was asked "Hi. Are you looking
+at THIS as an investment, or somewhere you'd live in yourself?" - "this" pointing at
+nothing, because the lead had not mentioned anything yet. Three turns later the same
+stiffness: "Understood." / "4 million, noted." / "A few months, noted." And the list of
+meeting times went out three times, byte for byte identical.
+
+It ignored a refusal and booked anyway. The lead said no to a meeting three times. The
+third message - "I dont want a meeting yet FIRST give me information about your property
+prices" - was read as "slot number one" and the bot confirmed the booking.
+
+1. QUESTION WORDING STOPS BEING A SEED STRING.
+
+   lqs.slot_definitions.question_open was doing two jobs: telling the composer what to
+   find out, and being the literal words sent to the lead. The composer prompt handed it
+   over under the heading "THE APPROVED QUESTION" and said "The question has already been
+   chosen for you. You only phrase it." So the model reproduced it, dangling "this" and
+   all.
+
+   New column question_goal holds what the turn must find out, in plain words. The
+   composer writes its own sentence from that. question_open is now only the fallback,
+   used when the composer errors or its output fails validation.
+
+   The "X, noted" tic came from the composer's own rule 3, whose example was literally
+   'Emaar Beachfront, noted" is fine'. The model copied the example into every turn. That
+   example is gone, replaced by a rule that reads EARLIER TURNS and forbids reusing an
+   acknowledgement that has already been spent.
+
+2. THE COMPOSER NOW WRITES EVERY TURN, NOT JUST QUESTIONS.
+
+   LQS - Subworkflow: compose question is renamed compose reply and rebuilt. It receives
+   the turn's action, its goal, the facts it may quote, what is already known about the
+   lead, whether this is the first turn, and any project the lead has named. It handles
+   ask_slot, resolve_conflict, offer_booking, reoffer_booking, confirm_booking,
+   already_booked, slot_taken, nurture and acknowledge_decline.
+
+   In core, the seven Assemble nodes stopped concatenating strings. They build composer
+   input and keep their old string as fallback_text. All seven now converge on one
+   Compose Reply node, which feeds Recheck Newest Message. The ask-only Compose Question
+   node is gone.
+
+   That is why the slot list repeated identically before: it was built by
+   String.fromCharCode(10) joins in a Code node, not written by anything.
+
+3. THE COMPOSER VALIDATES ITSELF.
+
+   New Validate Reply node in the sub-workflow, between the model and the return:
+
+     - every string in facts_json must survive verbatim, or fall back to the template.
+       A booking confirmation that renames the time is worse than a stiff one that gets
+       it right.
+     - no digit run may reach the lead unless it appears in facts, choices, the goal, the
+       lead's own words, the catalogue answer, what is known, or the history. This is
+       what blocks an invented price, date or meeting time.
+     - empty or over-length output falls back.
+
+   Temperature raised 0.3 -> 0.6 so repeated turns do not converge on the same sentence.
+
+4. A REFUSAL NOW HAS SOMEWHERE TO GO.
+
+   The intent enum had no value for it, so "No i dont want a meeting" was classified as
+   answering or unclear, matched no slot, and fell through Decide Next Step's last line
+   to reoffer_booking - with nothing capping it. v1.0.2 had removed escalation from that
+   loop, so by v1.1.1 nothing ended it at all.
+
+   New intent decline_booking, which outranks everything except request_human even when
+   the same message also asks a question. New action acknowledge_decline, handled before
+   the awaiting-choice block. Core's new Mark Booking Declined node closes the open offer
+   and increments conversations.booking_declines, so awaitingChoice goes false and the
+   bot stops trying to read a slot choice out of every message.
+
+   Policy: acknowledge, keep talking, do not raise a meeting again unprompted. One
+   decline stops unprompted offers for good. The lead asking (booking_intent) still gets
+   times. A booked lead who declines is a cancellation request, which the bot may not
+   handle - it falls through Route Action to cannot_decide and a human picks it up.
+
+5. PROSE ORDINALS NO LONGER BOOK MEETINGS.
+
+   matchOfferedSlot scored a bare "first" at 3 against a threshold of 2, so the word
+   inside a sentence was indistinguishable from a lead choosing option one. Three changes:
+
+     - a refusal guard runs before scoring and returns null outright when the message
+       contains no/not/dont/cant/wont/never/later/nope/nah/skip/busy/unavailable.
+     - an ordinal WORD scores 3 only in a message of five words or fewer; in longer prose
+       it scores 1 and can never book on its own. An ordinal DIGIT scores 4, so a bare
+       "1" still outranks another slot that happens to fall on the 1st.
+     - the confirm threshold is 3, not 2. A day number scores 3 and "31st" is normalised
+       to "31" before tokenising, which it never used to be.
+
+   Checked against 21 fixtures before deploying, including all three refusals from the
+   live conversation, "first one please", "1", "monday works", "tuesday", "the 31st",
+   "tuesday 1 sep" and "9:00" (ambiguous, correctly null).
+
+6. TWO SLOT LISTS IS THE LIMIT.
+
+   New threshold max_booking_offers, default 2, read from outbound messages sent since
+   the open offer was created. Past that the bot stops asking and stays useful instead.
+
+7. THE CATALOGUE ANSWER WAS NEVER UNGROUNDED-SAFE.  <-- the serious one
+
+   Shape Answer worked out `grounded` and then ignored it. It only ever substituted the
+   deflection when the text was EMPTY, so an ungrounded answer went to the lead word for
+   word.
+
+   That is how "I currently do not have any properties listed within your specified
+   budget range of 3,600,000 to 4,400,000 AED" was sent. The catalogue was not empty.
+   Running the exact query the search tool would have run, with that budget band, returns
+   NINE matching rows. The model had not called the tool, or ignored what it got, and
+   nothing downstream cared.
+
+   Now: if grounded is false, the text is replaced by the deflection, always. The prompt
+   also forbids announcing an empty shelf at all - an empty tool result means the answer
+   was not found, not that nothing exists - and forbids reading the lead's budget back as
+   a number.
+
+8. THE BUDGET BAND STOPS BEING QUOTED AS THE LEAD'S OWN FIGURE.
+
+   The extractor widens a stated budget by ten percent either side so the catalogue search
+   has a band. The lead said "4 million"; the system told them their "specified budget
+   range" was 3,600,000 to 4,400,000. They never said that.
+
+   The extractor now also returns stated_text, the budget in the lead's own words, which
+   survives normalisation. The brief shows "4 million (searched 3.6M AED to 4.4M AED)".
+   The composer is given stated_text, never the band, and is told to say "your budget".
+
+9. A DEFERRAL IS NOT AN ANSWER.
+
+   "I will tell later" was mapped onto the payment_method enum value `unsure` ("Not sure
+   yet"), which is a filled slot, so the ladder moved on and the agent was told the lead
+   had not decided how to pay. They had not said that.
+
+   The extraction hints for payment_method, timeline, unit_type, area_preference,
+   handover_preference and exit_strategy now say a deferral means leave the slot out.
+   It then gets re-asked once and, if dodged again, lands in the brief.
+
+   Assemble Brief also lifts required slots that were never answered into "Watch out for",
+   where they used to sit among a dozen optional ones in "Not covered".
+
+POST-PUBLISH TONE PASS (same day, composer prompt only)
+
+The first live turn after publishing came back as:
+
+  "I am helping you explore the current market, so I would love to know if you are
+   looking for an investment property or a place for yourself to live in?"
+
+The dangling "this" was gone, but the prompt had replaced it with waffle. Two causes,
+both in the rules written above:
+
+  - rule 10 said "say in one short clause what you are helping with, then ask", which is
+    an instruction to talk about yourself. The model followed it exactly.
+  - "no filler enthusiasm" was too abstract to catch "I would love to know".
+
+First correction over-shot in the other direction: asks became bare interrogations
+("What is your budget for this purchase?" - blunt, and pointing at a "this" that does not
+exist) and acknowledge_decline stopped acknowledging the decline at all, which is the one
+thing that turn exists to do.
+
+The prompt now separates the two ideas that were tangled together:
+
+  - cutting words ABOUT YOURSELF (banned, with an explicit list of openers)
+  - cutting words that MAKE A QUESTION ANSWERABLE (kept - "roughly", "a range is fine")
+
+and makes an acknowledgement mandatory whenever the lead pushes back, refuses, hesitates
+or defers, optional otherwise. A third pass added the enum-code rule after the model said
+"your plans for end-use" out loud - ALREADY KNOWN carries raw values like end_use and
+3_6m, and they must be translated or dropped.
+
+Verified, four scenarios, live model:
+
+  cold open "Hi"        -> "Are you looking to buy as an investment or for your own use?"
+  budget, after end_use -> "Roughly what are you looking to spend on your home? A range is fine."
+  decline + question    -> "That is fine. Marina Vista has 2-bed units from 3.8M AED with a
+                            60/40 payment plan, handing over Q4 2027. What else would you
+                            like to know about the current options?"
+  confirm_booking       -> "That is booked for Mon 31 Aug, 9:00 AM. The agent has all the
+                            details you shared, so you are all set."
+
+No workflow structure, node or database change - system message only, so per the project
+rules this is a prompt tweak rather than a new version. The snapshot in
+workflows/subworkflow-compose-reply__RIXG7dG23n7vH6Y1.json has been re-synced to the
+published text.
+
+Active version after this pass: RIXG7dG23n7vH6Y1 -> 0ddf6cb1-b4b3-4022-a477-61144488bc9c
+(supersedes b00b4ae6-1fff-4463-aeb9-66d55f6a6f25 listed below).
+
+SECOND LIVE PASS - "no" WAS READ AS A MEETING REFUSAL
+
+Transcript:
+
+  lead: hi
+  bot : Are you looking for somewhere to live in or an investment property?   (good)
+  lead: no
+  bot : That is fine. If you have any questions about the current projects or
+        need any details, just let me know.                                    (wrong)
+  lead: i want to inquire about the emaar beach front project
+  bot : I do not have that detail to hand, so the agent will go through the
+        current options with you. Are you looking at Emaar Beachfront as an
+        investment, somewhere to live in, both, or just browsing for now?
+
+The lead's "no" was a non-answer to an either/or question. It was classified
+decline_booking, and the damage was real and lasting - the conversation row
+afterwards read booking_declines = 1 with bookings_ever = 0, meaning a meeting
+refusal was recorded although no meeting had ever been offered, and purpose was
+[unanswered att2], meaning the slot had burned both attempts and would never be
+asked again.
+
+Not a bug: the Emaar Beachfront deflection. That development is genuinely not in
+the catalogue - the twelve seeded projects are synthetic (Marina Vista II, Creek
+Horizon Residences, and so on). The bot was right not to know it.
+
+FOUR FIXES
+
+a. THE EXTRACTOR WAS TOO EAGER. The rule written in this release listed "no" as
+   an example of decline_booking with nothing requiring the message to be about a
+   meeting at all. It now requires either that the message itself is about
+   meeting somebody, or that the previous outbound message offered times, and it
+   carries the worked example above as an explicit negative case. A bare "no" to
+   a qualification question is `unclear`.
+
+b. A REFUSAL NO LONGER ENDS THE CONVERSATION. This was the deeper fault, and it
+   would have bitten on a genuine refusal too: "no meeting, just send me prices"
+   at question two abandoned every remaining required slot. Decide Next Step now
+   folds the acknowledgement and the next pending tier-1 question into the same
+   message, and only becomes a terminal acknowledgement once nothing is left to
+   ask. Assemble Decline Reply carries slot_key, choices and asked_slot through
+   so Finalise Turn still counts the attempt.
+
+c. THE BOT OFFERED TO SEND THINGS IT CANNOT SEND. A dry-run produced "I can
+   certainly send over some information for you to look through." There is no
+   brochure, no email, no attachment and no mechanism that will ever do it. The
+   composer prompt now bans offering to send, email, share, forward or put
+   together anything, and the banned-phrase list applies anywhere in the message
+   rather than only at the start.
+
+d. THE DEFLECTION REPEATED WORD FOR WORD. "I do not have that detail to hand, so
+   the agent will go through the current options with you" was passed to the
+   composer as answer_text and copied out verbatim, so every lead asking about a
+   project we do not carry got the identical sentence - the exact repetition
+   problem this release exists to fix. Assemble Ask Reply and Assemble Offer
+   Reply now drop an ungrounded answer and fold it into the goal as an
+   instruction instead. The composer also learns whether the answer is grounded,
+   and rule 7 lets it honestly say a NAMED development is not one it covers,
+   which is different from claiming there is nothing for the lead.
+
+   Result: "I do not have details on Emaar Beachfront to hand, but the agent can
+   go through what is available with you. Are you looking for: Investment / To
+   live in / Both / Just browsing for now"
+
+DATA REPAIRED
+The test conversation was left with the false decline and the burned slot. Reset
+booking_declines to 0 and questions_asked to 0, and deleted the poisoned purpose
+row so it starts empty. project_interest = "Emaar Beachfront" was captured
+correctly and was kept.
+
+ACTIVE VERSIONS AFTER THIS PASS
+  FDtQFdAlFwsguA6v  361b9c73-0ab1-4b25-b44b-66c374e659c4
+  hpe6dyktPusHzO8O  78f9b826-f495-44b6-9d2a-3f48c856c7ac
+  RIXG7dG23n7vH6Y1  24d1f069-8421-4bad-92ab-4abfe2fda9e8
+  K0NKtJfBGWcU5vYS  72664998-2369-4be8-b7f9-13be9c2d4ac5
+
+The workflows/*.json in this folder are the state as first published and are now
+behind for these four. n8n version history holds the authoritative definitions at
+the ids above; the folder will be re-synced once the behaviour stops moving.
+
+THIRD LIVE PASS - THE SEARCH RETURNED NOTHING WHENEVER NO BUDGET WAS KNOWN
+
+This is the real root cause of the complaint that started this whole release.
+
+lqs Listings: search, node Normalise Filters:
+
+    function n(v) { if (v === null || v === undefined || v === '') return null; ... }
+    const budgetMax = n(i.budget_max);
+
+The tool description told the model "Use 0 when the lead has not given one", and
+n(0) returns 0, not null. The query clause is:
+
+    ($3::numeric is null or u.price_from <= $3::numeric)
+
+so budget_max = 0 became "price_from <= 0", which matches none of the 44 unit
+rows - the cheapest unit is 650,000. Every catalogue search made before a lead
+stated a budget came back empty. Verified: 44 rows normally, 0 rows with
+budget_max = 0.
+
+That is why a lead who asked "can you tell me what all projects you have?" was
+told "I do not have a full list of projects to hand" while twelve projects sat in
+the table, and it is very likely why the original transcript was told there were
+no properties in its budget range.
+
+FIXED
+- Normalise Filters treats any budget of zero or less as absent rather than as a
+  ceiling. Verified against the exact failing call: budget_min and budget_max
+  normalise to null and five real projects come back.
+- The $fromAI descriptions now say 0 means NO LIMIT, so the code and the
+  instruction agree.
+- Answer From Catalogue is told that "what do you have", "which projects are
+  available" and "what areas do you cover" are answerable: call with no filters,
+  limit 5, and name what comes back. Rule 3 also now forbids claiming to have no
+  LIST of projects, not just no properties.
+- Verified end to end: "can you tell me what all projects you have?" now returns
+  grounded true with three project_ids and names JVC Garden Homes, Riverside
+  Greens and Bay Central Tower.
+
+ALSO FIXED - REPEATED SENTENCE SHAPE
+Four consecutive replies opened "I do not have...". Each was worded differently,
+so the verbatim check passed, but the construction repeated and read exactly as
+mechanical as a literal repeat. The composer prompt now makes the model read the
+opening of its own previous message and forbids starting the same way twice.
+
+WATCH FOR
+The catalogue answer came back as "We have several exciting projects available
+right now..." - filler the answer agent's own prompt does not ban, unlike the
+composer's. The composer should strip it when it folds the answer in, because its
+rule 11 bans that phrasing anywhere. If it leaks to a lead, the answer agent's
+prompt needs the same tone rules as the composer.
+
+ACTIVE VERSIONS AFTER THIS PASS
+  RIrTl94qW1hkHG2d  9df9f2be-eb71-4502-97b1-125e2ac6ff56
+  necx1vepzlBnd58Q  9f8fe37c-a068-4455-ad31-0a0b24631c98
+  RIXG7dG23n7vH6Y1  93782f98-de65-4d65-ad31-161c34a5bdcf
+
+All lead data cleared again before the next test run.
+
+WORKFLOWS TOUCHED
+- subworkflow-compose-reply   (RIXG7dG23n7vH6Y1)  b00b4ae6-1fff-4463-aeb9-66d55f6a6f25
+  (renamed from "compose question"; file renamed too)
+- subworkflow-extract-facts   (FDtQFdAlFwsguA6v)  3f823add-5d1b-4cfa-bd15-683de0dffd97
+- listings-answer-question    (necx1vepzlBnd58Q)  ed69024a-2e27-44e8-872a-21019ec0ce45
+- brief-generate-and-deliver  (WrLLLmNkBCycCyZH)  863b9a9e-4eb9-4692-8e70-353f338e5921
+- qualification-decide-next-step (hpe6dyktPusHzO8O) e5b99a8c-8d3f-4c16-af5e-5269770bee20
+- core-handle-inbound-message (K0NKtJfBGWcU5vYS)  e7569cdc-d264-4f45-bd6b-c7985582819b
+- channel-telegram-inbound    (5Vk45QAHDDyTes0W)  87aa1847-fd51-410b-ae8b-3a111129e4a4
+  (unpublished during the work, republished unchanged)
+
+DATABASE TOUCHED
+schema/005_conversational_replies.sql   question_goal column + all 14 goals, decline
+                                        fallback lines, budget hint returns stated_text
+schema/006_track_declines.sql           conversations.booking_declines
+schema/007_deferral_is_not_an_answer.sql  deferral hints on six enum slots
+
+No table dropped, no row destroyed. The migrations are backward compatible with the
+pre-v1.3.0 workflows, which is why they could be applied before the workflows were
+published.
+
+TESTED BEFORE PUBLISHING
+
+matchOfferedSlot, 21 fixtures offline: 21 passed.
+
+Compose reply, five live dry-runs against the real model (sub-workflow only, no trigger,
+no writes, nothing sent):
+
+  cold open, "Hi", nothing known
+    -> "I can help you explore property options in Dubai. To get started, are you
+        looking for an investment or a place to live in yourself?"
+       No dangling "this". Does not treat "Hi" as an answer.
+
+  acknowledge_decline, "I dont want a meeting yet first give me information about your
+  property prices", with a grounded catalogue answer to fold in
+    -> accepted the refusal, answered the question, offered no meeting, quoted no
+       budget range.
+
+  confirm_booking
+    -> time reproduced verbatim, used_fallback false, said "your budget" not the band.
+
+  offer_booking then reoffer_booking with the first offer in history
+    -> two different sentences around the same three times, both verbatim.
+
+  (A sixth run failed validation with unsourced_number - that was the test harness
+  passing single-quoted pseudo-JSON in facts_json, so JSON.parse failed and facts came
+  back empty. The validator was right to reject it. Re-run with real JSON: passed.)
+
+RISK / WATCH FOR
+
+1. EVERY REPLY IS NOW A MODEL CALL. Before, only questions went through the model; slot
+   lists and confirmations were string joins. Latency and Gemini spend both go up by
+   roughly one call per turn. If the model is slow or down, Validate Reply falls back to
+   the old template, so the bot degrades to v1.2.0 wording rather than failing - but it
+   still waits for the timeout first.
+
+2. THE REFUSAL GUARD IS BLUNT. "not tuesday, monday" returns null and reoffers rather
+   than booking Monday. Safe direction, but a lead who phrases a pick negatively gets one
+   extra turn. Widening it means re-introducing the class of bug that caused this release.
+
+3. THE NUMBER CHECK CAN FALL BACK ON A GOOD REPLY. If the model writes a legitimate
+   number that appears nowhere in its inputs, the whole message is discarded for the
+   template. Watch used_fallback / fallback_reason in executions; a run of
+   unsourced_number means the allowed-sources list is too narrow.
+
+4. outbound_since_offer COUNTS ALL OUTBOUND MESSAGES after the offer, not slot lists
+   specifically. In practice every turn while awaiting a choice is a slot list, so the
+   two match - but if that stops being true the cap will bite early.
+
+5. NOTHING TELLS A LEAD WHY THEIR REFUSAL CHANGED THE BOT'S BEHAVIOUR. They just stop
+   being asked. That is deliberate.
+
+6. THE LIVE CONVERSATION DATA WAS ALREADY WIPED when this was investigated
+   (0 rows in conversations, messages, qualification, bookings), so none of the above was
+   confirmed against the actual execution records. It is all read from the workflow
+   definitions and the transcript screenshots.
+
+7. NOT YET EXERCISED END TO END. The composer dry-runs pass and the fixtures pass, but no
+   real lead has been through the rebuilt reply path.
+
+ROLLBACK
+n8n version history is the fast one - the previous active version ids are in
+../2026-08-29_v1.2.0_validate-contact-details/workflows/MANIFEST.md.
+For the durable one, restore workflows/ from that folder, and optionally:
+  alter table lqs.conversations drop column booking_declines;
+  alter table lqs.slot_definitions drop column question_goal;
+Rolling back reinstates the forced booking and the identical-slot-list loop, so prefer
+fixing forward.

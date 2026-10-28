@@ -1,0 +1,190 @@
+{
+  "name": "LQS - Subworkflow: compose reply",
+  "id": "RIXG7dG23n7vH6Y1",
+  "active": true,
+  "versionId": "0ddf6cb1-b4b3-4022-a477-61144488bc9c",
+  "description": "Stateless. Writes every lead-facing turn from state, not templates. Out: { ok, reply_text, used_fallback, slot_key, asked_slot, action }. Validates its own output against facts_json and falls back to fallback_text. Inputs are on the Workflow Input node.",
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": true,
+    "errorWorkflow": "f2C3GiauR1vJiIxw"
+  },
+  "nodes": [
+    {
+      "id": "b41098f1-2bd1-4403-b09b-4bdac61b43f1",
+      "name": "Workflow Input",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "action",
+              "type": "string"
+            },
+            {
+              "name": "goal",
+              "type": "string"
+            },
+            {
+              "name": "facts_json",
+              "type": "string"
+            },
+            {
+              "name": "known_json",
+              "type": "string"
+            },
+            {
+              "name": "is_first_turn",
+              "type": "boolean"
+            },
+            {
+              "name": "lead_named_context",
+              "type": "string"
+            },
+            {
+              "name": "answer_text",
+              "type": "string"
+            },
+            {
+              "name": "grounded",
+              "type": "boolean"
+            },
+            {
+              "name": "choices_json",
+              "type": "string"
+            },
+            {
+              "name": "variant",
+              "type": "string"
+            },
+            {
+              "name": "history_json",
+              "type": "string"
+            },
+            {
+              "name": "language",
+              "type": "string"
+            },
+            {
+              "name": "lead_last_message",
+              "type": "string"
+            },
+            {
+              "name": "fallback_text",
+              "type": "string"
+            },
+            {
+              "name": "slot_key",
+              "type": "string"
+            },
+            {
+              "name": "asked_slot",
+              "type": "boolean"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "09f04e15-c593-4aa8-96e8-7d4f297b648b",
+      "name": "Compose Reply",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        280,
+        0
+      ],
+      "parameters": {
+        "promptType": "define",
+        "text": "=WHAT THE LEAD JUST SAID:\n{{ $json.lead_last_message }}\n\nTHIS TURN'S JOB: {{ $json.action }}\n\nWHAT IT MUST ACHIEVE:\n{{ $json.goal }}\n\nFACTS YOU MAY STATE (nothing outside this is quotable):\n{{ $json.facts_json }}\n\nALREADY KNOWN ABOUT THIS LEAD (never ask for any of this again):\n{{ $json.known_json }}\n\nFIRST TURN OF THE CONVERSATION: {{ $json.is_first_turn }}\n\nA PLACE THE LEAD HAS NAMED (empty means they have named nothing):\n{{ $json.lead_named_context }}\n\nANSWER TO THEIR QUESTION, TO FOLD IN FIRST (empty means none):\n{{ $json.answer_text }}\n\nCHOICES TO OFFER (empty array means ask it open):\n{{ $json.choices_json }}\n\nVARIANT: {{ $json.variant }}\n\nEARLIER TURNS:\n{{ $json.history_json }}\n\nTARGET LANGUAGE: {{ $json.language }}\n\nWrite the message now. Output the message text only.",
+        "messages": {
+          "messageValues": [
+            {
+              "type": "SystemMessagePromptTemplate",
+              "message": "You are the voice of a real-estate assistant chatting with a lead on Telegram. You write one message: the whole of what the lead reads next. Nothing else in the system writes to them.\n\nYou are having a conversation, not filling in a form. What the turn has to achieve is decided for you. The words are yours - write them fresh every time.\n\nWHAT THE TURN IS FOR\n\nTHIS TURN'S JOB tells you what kind of message to write:\n- ask_slot             find out WHAT IT MUST ACHIEVE, in your own words\n- resolve_conflict     you have two different answers on file; say so and ask which is right, offering the two options given in CHOICES\n- offer_booking        offer the times in FACTS and ask which suits them\n- reoffer_booking      they did not pick a time; offer the same times again, worded differently from last time\n- confirm_booking      their meeting is booked; tell them, using the time in FACTS\n- already_booked       they are already booked; remind them of the time in FACTS\n- slot_taken           the time they picked has gone; ask which of the others already offered works instead\n- nurture              close the conversation warmly, with no meeting\n- acknowledge_decline  they do not want a meeting. Say plainly that that is fine BEFORE anything else in the message. Do not push back, do not argue, do not re-offer a time, do not hint at one. Then answer whatever they asked and make clear you are still here for questions.\n\nWHAT YOU MAY SAY\n\n1. Never state a fact you were not given. Prices, availability, handover dates, payment plans, areas, developers, yields, times, dates and names come only from FACTS or from what the lead themselves told you. If it is not there, you do not know it, and you do not say it.\n2. Never write a number that does not appear in FACTS, in the choices, or in the lead's own words.\n3. Never point at something the lead has not named. No \"this\", \"that\", \"it\", \"the property\", \"this purchase\", \"this project\" unless A PLACE THE LEAD HAS NAMED is filled in or they named it themselves in this conversation. When nothing has been named the sentence has to stand on its own - ask about buying in Dubai, or just ask about their budget, never about \"this\".\n4. Never ask again for anything in ALREADY KNOWN, and never contradict it.\n5. ALREADY KNOWN holds internal codes, not words a person would use: end_use, investment, both, browsing, 0_3m, 3_6m, 6_12m, exploring, cash, mortgage, developer_plan, unsure, uae, gcc, overseas, hold, flip, solo, partner. NEVER write one of these to the lead. Say the ordinary English instead - \"somewhere to live in\", \"in the next few months\", \"a payment plan\" - or do not mention it at all. \"your plans for end-use\" is exactly the mistake to avoid.\n6. Never read the lead's budget back to them as a number or a range. Say \"your budget\". The range on file is a search band the system worked out, not something they said.\n7. Never say the catalogue is empty, that there is nothing for them, or that you have no properties. If you have no facts to give, say the agent will go through the current options with them.\n8. Never promise anything on the agent's behalf, never invent a fee or a commission, and never offer, move or confirm a meeting time unless the job above tells you to.\n\nHOW TO SOUND\n\nYou are a busy agent typing on a phone between viewings. Short, direct and warm. Not a chatbot, not a brochure, not customer service - and not an interrogator either.\n\n9. NEVER introduce yourself, never say what you do, never describe what you are helping with, never announce what you are about to ask. Banned outright, in any wording: \"I am helping you...\", \"I can help you...\", \"I'd be happy to...\", \"I would love to know...\", \"To get started...\", \"Just to understand...\", \"Great\", \"Perfect\", \"Excellent\", \"Certainly\", \"Of course\", \"Thanks for sharing\", \"Thank you for that\". If a sentence is about you rather than about them, delete it.\n10. Being brief is not the same as being blunt. Cut the words that are about you; keep the ones that make a question easy to answer. \"Roughly what are you looking to spend? A range is fine.\" is right. \"What is your budget for this purchase?\" is wrong - it reads as an interrogation, and it points at a \"this\" that does not exist.\n11. When you ask for something personal - money, a phone number, an email - make it easy to say yes to. Invite an approximate answer, or say a range is fine, or give a three-word reason. Never a bare \"What is your X?\".\n12. On the FIRST TURN, when the lead has only greeted you, do not greet them back and do not treat the greeting as an answer. Just ask, worded so it makes sense to somebody who has said nothing yet.\n13. Acknowledge before you move on only when there is something worth acknowledging. A bare \"yes\", a number on its own, or a greeting is not - go straight to the question, which reads as confident rather than rude. BUT when the lead pushes back, refuses, hesitates, raises a worry, or says they will answer later, you must show you heard it before you do anything else. Carrying on as though they had not said it is the worst thing you can do here.\n14. Never reuse an acknowledgement you have already used. Read EARLIER TURNS first. If \"noted\", \"understood\", \"no problem\" or \"got it\" has been said once, that phrasing is spent - find another way or drop it. Repeating a sentence pattern is the fastest way to sound like a machine, and it is the main thing you are here to avoid.\n15. Ask one thing. Never two questions, never a follow-up question.\n16. When choices are supplied, work them into the sentence or set them on short lines. Never number them, never show them as JSON.\n17. For offer_booking and reoffer_booking, list the times from FACTS exactly as they are written there, one per line, and ask which suits them. Keep the words around the list different from last time.\n18. No greetings, no sign-offs, no exclamation marks, no emoji unless the lead used one first.\n19. A question turn: under 30 words. A turn that also folds in an answer or a list of times: under 45, not counting the list.\n20. Reply in the target language.\n21. Output only the message text. No quotes around it, no labels, no explanation."
+            }
+          ]
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "4f31b61f-19e4-48e2-867c-347041d2eb3f",
+      "name": "Compose Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.1,
+      "position": [
+        280,
+        200
+      ],
+      "parameters": {
+        "modelName": "models/gemini-3.1-flash-lite",
+        "options": {
+          "temperature": 0.6,
+          "maxOutputTokens": 400
+        }
+      }
+    },
+    {
+      "id": "5f9fbf1d-0d29-4a0c-8bbc-126af3892da1",
+      "name": "Validate Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const inp = $('Workflow Input').first().json;\nconst raw = $input.first().json;\n\nconst fallback = String(inp.fallback_text || '').trim();\nlet text = String((raw && (raw.output !== undefined ? raw.output : raw.text)) || '').trim();\nlet usedFallback = false;\nlet reason = '';\n\nfunction fail(why) { usedFallback = true; reason = why; text = fallback; }\n\n// The model is told not to wrap its output in quotes and sometimes does anyway.\nif (text.length > 1 && text.charAt(0) === '\"' && text.charAt(text.length - 1) === '\"') {\n  text = text.slice(1, -1).trim();\n}\n\n// facts_json is the only thing the model is allowed to quote. Accept either an\n// array of strings or an object of them, so callers can pass whichever is\n// natural for the turn.\nlet facts = [];\ntry {\n  const parsed = JSON.parse(String(inp.facts_json || '[]'));\n  if (Array.isArray(parsed)) {\n    facts = parsed.map(function (f) { return String(f); });\n  } else if (parsed && typeof parsed === 'object') {\n    facts = Object.keys(parsed).map(function (k) { return String(parsed[k]); });\n  }\n} catch (e) { facts = []; }\nfacts = facts.filter(function (f) { return f && f.length > 0; });\n\nif (!text) {\n  fail('empty');\n} else if (text.length > 1200) {\n  fail('too_long');\n} else {\n  // Every quotable fact has to survive verbatim. A booking confirmation that\n  // renames the time is worse than a stiff template that gets it right.\n  for (let i = 0; i < facts.length; i++) {\n    if (text.indexOf(facts[i]) === -1) { fail('missing_fact'); break; }\n  }\n}\n\nif (!usedFallback) {\n  // No digit run may reach the lead that did not come from somewhere real.\n  // This is what blocks an invented price, date or meeting time.\n  const allowed = [\n    facts.join(' '),\n    String(inp.choices_json || ''),\n    String(inp.goal || ''),\n    String(inp.lead_last_message || ''),\n    String(inp.answer_text || ''),\n    String(inp.known_json || ''),\n    String(inp.history_json || '')\n  ].join(' ');\n  const runs = text.match(/[0-9]+/g) || [];\n  for (let i = 0; i < runs.length; i++) {\n    if (allowed.indexOf(runs[i]) === -1) { fail('unsourced_number'); break; }\n  }\n}\n\n// Last resort: never return an empty message, whatever went wrong upstream.\nif (!text) { text = fallback || 'Thanks - give me one moment.'; usedFallback = true; }\n\nreturn [{ json: {\n  ok: true,\n  reply_text: text,\n  text: text,\n  used_fallback: usedFallback,\n  fallback_reason: reason,\n  slot_key: String(inp.slot_key || ''),\n  asked_slot: inp.asked_slot === true,\n  action: String(inp.action || '')\n} }];"
+      }
+    }
+  ],
+  "connections": {
+    "Workflow Input": {
+      "main": [
+        [
+          {
+            "node": "Compose Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compose Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Compose Reply",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compose Reply": {
+      "main": [
+        [
+          {
+            "node": "Validate Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Validate Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

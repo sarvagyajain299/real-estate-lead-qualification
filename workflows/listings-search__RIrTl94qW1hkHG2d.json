@@ -1,0 +1,200 @@
+{
+  "name": "LQS - Listings: search",
+  "id": "RIrTl94qW1hkHG2d",
+  "active": true,
+  "versionId": "4eab910e-b5cf-413a-ae0c-e32e6ef10c3c",
+  "description": "Stateless read, also wired as the answer bot's only tool. In: market_id plus optional budget_min, budget_max, bedrooms, area, handover_year, developer, project_name, limit. Out: { ok, count, results }. Ordered by closest price to the budget midpoint.",
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": true,
+    "errorWorkflow": "f2C3GiauR1vJiIxw"
+  },
+  "nodes": [
+    {
+      "name": "Workflow Input",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "market_id",
+              "type": "string"
+            },
+            {
+              "name": "budget_min",
+              "type": "number"
+            },
+            {
+              "name": "budget_max",
+              "type": "number"
+            },
+            {
+              "name": "bedrooms",
+              "type": "string"
+            },
+            {
+              "name": "area",
+              "type": "string"
+            },
+            {
+              "name": "handover_year",
+              "type": "string"
+            },
+            {
+              "name": "developer",
+              "type": "string"
+            },
+            {
+              "name": "project_name",
+              "type": "string"
+            },
+            {
+              "name": "limit",
+              "type": "number"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Normalise Filters",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const i = $input.first().json;\n\nfunction s(v) {\n  const t = (v === null || v === undefined) ? '' : String(v).trim();\n  return t.length ? t : null;\n}\nfunction n(v) {\n  if (v === null || v === undefined || v === '') return null;\n  const x = Number(v);\n  return isFinite(x) ? x : null;\n}\n\nconst bedroomsRaw = s(i.bedrooms);\nconst bedrooms = (bedroomsRaw === null || bedroomsRaw.toLowerCase() === 'any') ? null : (isFinite(Number(bedroomsRaw)) ? Math.floor(Number(bedroomsRaw)) : null);\n\nconst areaRaw = s(i.area);\nconst area = (areaRaw && areaRaw.toLowerCase() !== 'any') ? areaRaw.toLowerCase() : null;\n\nconst budgetMin = n(i.budget_min);\nconst budgetMax = n(i.budget_max);\nlet mid = null;\nif (budgetMin !== null && budgetMax !== null) mid = (budgetMin + budgetMax) / 2;\nelse if (budgetMax !== null) mid = budgetMax;\nelse if (budgetMin !== null) mid = budgetMin;\n\nconst yearRaw = s(i.handover_year);\nconst year = (yearRaw && /^[0-9]{4}$/.test(yearRaw)) ? yearRaw : null;\n\nconst lim = n(i.limit);\n\nreturn [{ json: {\n  market_id: s(i.market_id),\n  budget_min: budgetMin,\n  budget_max: budgetMax,\n  bedrooms: bedrooms,\n  area: area,\n  handover_year: year,\n  developer: s(i.developer),\n  project_name: s(i.project_name),\n  midpoint: mid,\n  row_limit: (lim !== null && lim > 0) ? Math.min(Math.floor(lim), 20) : 3\n} }];"
+      }
+    },
+    {
+      "name": "Search Listings",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        480,
+        0
+      ],
+      "alwaysOutputData": true,
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "select p.id as project_id, p.name as name, p.developer as developer, p.area as area, p.handover_quarter as handover_quarter, p.payment_plan as payment_plan, p.resale_threshold_pct as resale_threshold_pct, p.gross_yield_estimate as gross_yield_estimate, u.bedrooms as bedrooms, u.price_from as price_from, u.price_to as price_to from lqs.projects p join lqs.unit_types u on u.project_id = p.id where p.active and p.status <> 'sold_out' and ($1::uuid is null or p.market_id = $1::uuid) and ($2::numeric is null or coalesce(u.price_to, u.price_from) >= $2::numeric) and ($3::numeric is null or u.price_from <= $3::numeric) and ($4::int is null or u.bedrooms = $4::int) and ($5::text is null or p.area = $5::text) and ($6::text is null or left(p.handover_quarter, 4) = $6::text) and ($7::text is null or p.developer ilike '%' || $7::text || '%') and ($8::text is null or p.name ilike '%' || $8::text || '%') order by (case when $9::numeric is null then 0 else abs(u.price_from - $9::numeric) end) asc, u.price_from asc, p.name asc limit $10::int;",
+        "options": {
+          "largeNumbersOutput": "numbers",
+          "queryReplacement": "={{ [$json.market_id, $json.budget_min, $json.budget_max, $json.bedrooms, $json.area, $json.handover_year, $json.developer, $json.project_name, $json.midpoint, $json.row_limit] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "CREDENTIAL_ID",
+          "name": "postgres (set your own)"
+        }
+      }
+    },
+    {
+      "name": "Shape Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const rows = $input.all().map(function (i) { return i.json; }).filter(function (r) { return r && r.project_id; });\n\nfunction num(v) { return (v === null || v === undefined || v === '') ? null : Number(v); }\n\nconst results = rows.map(function (r) {\n  return {\n    project_id: r.project_id,\n    name: r.name,\n    developer: r.developer,\n    area: r.area,\n    handover_quarter: r.handover_quarter,\n    payment_plan: r.payment_plan,\n    resale_threshold_pct: num(r.resale_threshold_pct),\n    gross_yield_estimate: num(r.gross_yield_estimate),\n    bedrooms: num(r.bedrooms),\n    price_from: num(r.price_from),\n    price_to: num(r.price_to)\n  };\n});\n\nreturn [{ json: { ok: true, count: results.length, results: results } }];"
+      }
+    },
+    {
+      "name": "Return",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        960,
+        0
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ok",
+              "name": "ok",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "count",
+              "name": "count",
+              "value": "={{ $json.count }}",
+              "type": "number"
+            },
+            {
+              "id": "res",
+              "name": "results",
+              "value": "={{ $json.results }}",
+              "type": "array"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Workflow Input": {
+      "main": [
+        [
+          {
+            "node": "Normalise Filters",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalise Filters": {
+      "main": [
+        [
+          {
+            "node": "Search Listings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Listings": {
+      "main": [
+        [
+          {
+            "node": "Shape Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shape Results": {
+      "main": [
+        [
+          {
+            "node": "Return",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

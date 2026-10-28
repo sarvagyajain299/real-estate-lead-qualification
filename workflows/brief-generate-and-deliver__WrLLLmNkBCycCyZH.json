@@ -1,0 +1,536 @@
+{
+  "name": "LQS - Brief: generate and deliver",
+  "id": "WrLLLmNkBCycCyZH",
+  "active": true,
+  "versionId": "863b9a9e-4eb9-4692-8e70-353f338e5921",
+  "description": "In: conversation_id, booking_id. Out: { ok, brief_id, delivered_to }. Six fixed blocks; blocks 1, 4, 5 and 6 are assembled by code from database rows only, blocks 2 and 3 go through one LLM call with a raw-value fallback. Delivers to Telegram, email and the calendar event.",
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": true,
+    "errorWorkflow": "f2C3GiauR1vJiIxw"
+  },
+  "nodes": [
+    {
+      "name": "Workflow Input",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "conversation_id",
+              "type": "string"
+            },
+            {
+              "name": "booking_id",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Load Brief Data",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        240,
+        0
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "select c.id as conversation_id, c.channel as channel, c.language as language, c.status as conversation_status, c.escalation_reason as escalation_reason, c.questions_asked as questions_asked, l.id as lead_id, l.full_name as lead_name, l.email as lead_email, l.phone as lead_phone, l.timezone as lead_tz, l.status as lead_status, m.timezone as market_tz, m.currency as currency, a.id as agent_id, a.full_name as agent_name, a.email as agent_email, a.telegram_chat_id as agent_chat_id, a.calendar_id as calendar_id, coalesce(a.timezone, m.timezone) as agent_tz, (select row_to_json(bb) from (select bk.id, bk.starts_at, bk.ends_at, bk.status, bk.calendar_event_id from lqs.bookings bk where bk.conversation_id = c.id and (nullif($2, '') is null or bk.id = nullif($2, '')::uuid) order by bk.created_at desc limit 1) bb) as booking, (select coalesce(json_agg(json_build_object('slot_key', q.slot_key, 'value', q.value, 'state', q.state, 'attempts', q.attempts, 'previous_values', q.previous_values) order by sd.priority), '[]'::json) from lqs.qualification q join lqs.slot_definitions sd on sd.slot_key = q.slot_key and sd.market_id = c.market_id and sd.deal_type = c.deal_type where q.conversation_id = c.id) as qualification, (select coalesce(json_agg(json_build_object('slot_key', sd.slot_key, 'question_open', sd.question_open, 'tier', sd.tier, 'required', sd.required) order by sd.priority), '[]'::json) from lqs.slot_definitions sd where sd.market_id = c.market_id and sd.deal_type = c.deal_type and sd.active) as slot_definitions, (select coalesce(json_agg(json_build_object('direction', mm.direction, 'body', mm.body, 'created_at', mm.created_at) order by mm.created_at), '[]'::json) from lqs.messages mm where mm.conversation_id = c.id) as transcript, (select coalesce(json_agg(json_build_object('id', p.id, 'name', p.name)), '[]'::json) from lqs.projects p where p.market_id = c.market_id and p.active) as projects from lqs.conversations c join lqs.leads l on l.id = c.lead_id join lqs.markets m on m.id = c.market_id cross join lateral (select ag.* from lqs.agents ag where ag.active and ag.market_id = c.market_id order by ag.created_at limit 1) a where c.id = $1::uuid;",
+        "options": {
+          "queryReplacement": "={{ [$json.conversation_id, $json.booking_id || ''] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "CREDENTIAL_ID",
+          "name": "postgres (set your own)"
+        }
+      }
+    },
+    {
+      "name": "Brief Prose Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.1,
+      "position": [
+        480,
+        220
+      ],
+      "parameters": {
+        "modelName": "models/gemini-3.1-flash-lite",
+        "options": {
+          "temperature": 0.2,
+          "maxOutputTokens": 512
+        }
+      },
+      "credentials": {
+        "googlePalmApi": {
+          "id": "CREDENTIAL_ID",
+          "name": "googlePalmApi (set your own)"
+        }
+      }
+    },
+    {
+      "name": "Brief Prose Retry Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.1,
+      "position": [
+        700,
+        340
+      ],
+      "parameters": {
+        "modelName": "models/gemini-3.1-flash-lite",
+        "options": {
+          "temperature": 0
+        }
+      },
+      "credentials": {
+        "googlePalmApi": {
+          "id": "CREDENTIAL_ID",
+          "name": "googlePalmApi (set your own)"
+        }
+      }
+    },
+    {
+      "name": "Brief Prose Schema",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        660,
+        220
+      ],
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\"type\":\"object\",\"properties\":{\"summary\":{\"type\":\"string\"},\"watch_out\":{\"type\":\"string\"}},\"required\":[\"summary\",\"watch_out\"]}",
+        "autoFix": true
+      }
+    },
+    {
+      "name": "Write Summary And Watchouts",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        480,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "promptType": "define",
+        "hasOutputParser": true,
+        "text": "=QUALIFICATION ON FILE (one row per slot):\n{{ JSON.stringify($json.qualification) }}\n\nESCALATION REASON (empty when none): {{ $json.escalation_reason }}\n\nQUESTIONS ASKED SO FAR: {{ $json.questions_asked }}\n\nCURRENCY: {{ $json.currency }}",
+        "messages": {
+          "messageValues": [
+            {
+              "type": "SystemMessagePromptTemplate",
+              "message": "You write two short pieces of an internal briefing note for a real-estate agent about to take a call. The agent has thirty seconds to read it.\n\nsummary: one sentence naming who this lead is and what they want, built only from the values on file. Never invent a fact. Never name a project, a price or a date that is not in the data.\n\nwatch_out: one or two short sentences on what could go wrong on this call. Draw only on: conflicting answers, exit strategy, who else is in the decision, slots the lead dodged, and any escalation reason. If there is genuinely nothing to flag, write exactly: Nothing unusual.\n\nPlain English. No headings, no bullets, no markdown, no greetings. Never address the lead. Never give advice about what to sell."
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Assemble Brief",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const d = $('Load Brief Data').first().json;\nconst llmRaw = $input.first().json || {};\nconst llm = (llmRaw && typeof llmRaw.output === 'object' && llmRaw.output !== null) ? llmRaw.output : llmRaw;\n\nconst qual = Array.isArray(d.qualification) ? d.qualification : [];\nconst defs = Array.isArray(d.slot_definitions) ? d.slot_definitions : [];\nconst transcript = Array.isArray(d.transcript) ? d.transcript : [];\nconst projects = Array.isArray(d.projects) ? d.projects : [];\nconst booking = d.booking || null;\nconst agentTz = d.agent_tz || d.market_tz || 'Asia/Dubai';\nconst currency = d.currency || 'AED';\n\nfunction fmtMoney(n, cur) {\n  const c = cur || currency;\n  if (n >= 1000000) return (Math.round((n / 1000000) * 10) / 10) + 'M ' + c;\n  if (n >= 1000) return Math.round(n / 1000) + 'K ' + c;\n  return n + ' ' + c;\n}\n\nfunction renderValue(v) {\n  if (v === null || v === undefined) return 'not given';\n  if (typeof v === 'object' && !Array.isArray(v)) {\n    if (typeof v.min === 'number' || typeof v.max === 'number') {\n      // The band is ours; stated_text is what the lead actually said. The agent\n      // needs to see their words, not the number the search was run on.\n      if (typeof v.stated_text === 'string' && v.stated_text) {\n        if (typeof v.min === 'number' && typeof v.max === 'number') return v.stated_text + ' (searched ' + fmtMoney(v.min, v.currency) + ' to ' + fmtMoney(v.max, v.currency) + ')';\n        return v.stated_text;\n      }\n      if (typeof v.min === 'number' && typeof v.max === 'number') return fmtMoney(v.min, v.currency) + ' to ' + fmtMoney(v.max, v.currency);\n      if (typeof v.max === 'number') return 'up to ' + fmtMoney(v.max, v.currency);\n      return 'from ' + fmtMoney(v.min, v.currency);\n    }\n    const bits = [];\n    if (v.full_name) bits.push(v.full_name);\n    if (v.phone) bits.push(v.phone);\n    if (v.email) bits.push(v.email);\n    if (bits.length) return bits.join(', ');\n    return JSON.stringify(v);\n  }\n  return String(v);\n}\n\nfunction slotValue(key) {\n  for (const q of qual) { if (q.slot_key === key) return q; }\n  return null;\n}\n\nconst meetingLine = (booking && booking.starts_at)\n  ? DateTime.fromISO(booking.starts_at).setZone(agentTz).toFormat('cccc d LLLL yyyy, h:mm a') + ' (' + agentTz + ')'\n  : 'no meeting booked';\n\nconst contact = slotValue('contact');\nconst contactValue = contact ? contact.value : null;\nconst displayName = d.lead_name || (contactValue && contactValue.full_name) || 'Unnamed lead';\nconst phone = d.lead_phone || (contactValue && contactValue.phone) || 'not given';\nconst email = d.lead_email || (contactValue && contactValue.email) || 'not given';\nconst residency = slotValue('residency');\nconst based = residency && residency.value ? renderValue(residency.value) : 'not given';\n\nconst block1 = {\n  name: displayName,\n  phone: phone,\n  email: email,\n  meeting: meetingLine,\n  channel: d.channel || 'unknown',\n  based: based\n};\n\nconst filled = qual.filter(function (q) { return q.state === 'filled' || q.state === 'conflicted'; });\nconst rawList = filled.map(function (q) { return q.slot_key + ': ' + renderValue(q.value); }).join(', ');\nconst summary = (typeof llm.summary === 'string' && llm.summary.trim()) ? llm.summary.trim() : (rawList || 'No qualification data captured.');\n\nconst flags = [];\nfor (const c of qual) {\n  if (c.state !== 'conflicted') continue;\n  const prev = Array.isArray(c.previous_values) ? c.previous_values : [];\n  const oldV = prev.length ? prev[prev.length - 1] : null;\n  flags.push('Conflicting answers on ' + c.slot_key + ': had ' + renderValue(oldV) + ', now ' + renderValue(c.value) + '.');\n}\nconst exitStrategy = slotValue('exit_strategy');\nif (exitStrategy && String(exitStrategy.value) === 'flip') flags.push('Plans to sell before handover, so check the resale threshold on anything you pitch.');\nconst decisionMaker = slotValue('decision_maker');\nif (decisionMaker && decisionMaker.value && String(decisionMaker.value) !== 'solo') flags.push('Not deciding alone (' + renderValue(decisionMaker.value) + ').');\nconst dodged = qual.filter(function (q) { return q.state === 'unanswered'; }).map(function (q) { return q.slot_key; });\nif (dodged.length) flags.push('Dodged after two asks: ' + dodged.join(', ') + '.');\n// A required slot that never got an answer used to leave no trace at all: the\n// brief simply did not mention it, so the agent had no way to know the gap was\n// there. Deferrals (\"I'll tell you later\") land here.\nconst answered = {};\nfor (const q of qual) { if (q.state === 'filled' || q.state === 'conflicted') answered[q.slot_key] = true; }\nconst missingRequired = defs\n  .filter(function (s) { return s.required === true && !answered[s.slot_key] && dodged.indexOf(s.slot_key) === -1; })\n  .map(function (s) { return s.slot_key; });\nif (missingRequired.length) flags.push('Never answered, worth asking on the call: ' + missingRequired.join(', ') + '.');\nif (d.escalation_reason) flags.push('Handed to a human. Reason: ' + d.escalation_reason + '.');\n\nconst watchLlm = (typeof llm.watch_out === 'string' && llm.watch_out.trim()) ? llm.watch_out.trim() : '';\nconst block3Lines = [];\nif (watchLlm) block3Lines.push(watchLlm);\nfor (const f of flags) block3Lines.push(f);\nif (block3Lines.length === 0) block3Lines.push('Nothing unusual.');\n\nconst shown = [];\nfor (let i = 0; i < transcript.length; i++) {\n  const t = transcript[i];\n  if (t.direction !== 'outbound' || !t.body) continue;\n  const body = String(t.body).toLowerCase();\n  for (const p of projects) {\n    const nm = String(p.name || '').toLowerCase();\n    if (!nm || body.indexOf(nm) === -1) continue;\n    let already = false;\n    for (const s of shown) { if (s.project_id === p.id) { already = true; break; } }\n    if (already) continue;\n    let reacted = false;\n    for (let j = i + 1; j < transcript.length; j++) {\n      if (transcript[j].direction === 'inbound') {\n        const firstWord = nm.split(' ')[0];\n        reacted = String(transcript[j].body || '').toLowerCase().indexOf(firstWord) !== -1;\n        break;\n      }\n    }\n    shown.push({ project_id: p.id, name: p.name, reacted: reacted });\n  }\n}\n\nconst asked = [];\nfor (let i = 0; i < transcript.length; i++) {\n  const t = transcript[i];\n  if (t.direction !== 'inbound' || !t.body) continue;\n  if (String(t.body).indexOf('?') === -1) continue;\n  let answer = '';\n  for (let j = i + 1; j < transcript.length; j++) {\n    if (transcript[j].direction === 'outbound') { answer = String(transcript[j].body || ''); break; }\n  }\n  asked.push({ question: String(t.body), answer: answer });\n}\n\nconst notCovered = [];\nfor (const def of defs) {\n  const q = slotValue(def.slot_key);\n  const st = q ? q.state : 'empty';\n  if (st === 'empty' || st === 'unanswered') {\n    notCovered.push({ slot_key: def.slot_key, state: st, question: def.question_open });\n  }\n}\n\nconst lines = [];\nlines.push('# Lead brief: ' + block1.name);\nlines.push('');\nlines.push('**Meeting:** ' + block1.meeting);\nlines.push('**Phone:** ' + block1.phone + '  |  **Email:** ' + block1.email);\nlines.push('**Channel:** ' + block1.channel + '  |  **Based:** ' + block1.based);\nlines.push('');\nlines.push('## Summary');\nlines.push(summary);\nlines.push('');\nlines.push('## Watch out for');\nfor (const l of block3Lines) lines.push('- ' + l);\nlines.push('');\nlines.push('## Shown');\nif (shown.length === 0) {\n  lines.push('- No specific projects were put in front of them.');\n} else {\n  for (const s of shown) lines.push('- ' + s.name + (s.reacted ? ' (they came back on this one)' : ' (no reaction)'));\n}\nlines.push('');\nlines.push('## Asked about');\nif (asked.length === 0) {\n  lines.push('- They asked nothing.');\n} else {\n  for (const a of asked) lines.push('- They asked: ' + a.question + '\\n  We said: ' + (a.answer || 'no reply recorded'));\n}\nlines.push('');\nlines.push('## Not covered');\nif (notCovered.length === 0) {\n  lines.push('- Everything covered.');\n} else {\n  for (const n of notCovered) lines.push('- ' + n.slot_key + ' (' + n.state + '): ' + n.question);\n}\n\nconst markdown = lines.join('\\n');\n\nfunction escapeHtml(s) {\n  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n}\nconst telegramText = escapeHtml(markdown.replace(/^#+\\s*/gm, '').replace(/\\*\\*/g, ''));\n\nconst blocks = {\n  header: block1,\n  summary: summary,\n  watch_out: block3Lines,\n  shown: shown,\n  asked: asked,\n  not_covered: notCovered\n};\n\nreturn [{ json: {\n  conversation_id: d.conversation_id,\n  booking_id: booking ? booking.id : '',\n  content_markdown: markdown,\n  content_blocks_json: JSON.stringify(blocks),\n  telegram_text: telegramText.slice(0, 3900),\n  calendar_description: markdown.slice(0, 7000),\n  subject: 'Lead brief: ' + block1.name + ' - ' + block1.meeting\n} }];"
+      }
+    },
+    {
+      "name": "Insert Brief",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1180,
+        0
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "insert into lqs.briefs (conversation_id, booking_id, content_markdown, content_blocks, delivered_to) values ($1::uuid, nullif($2, '')::uuid, $3, $4::jsonb, '{}'::jsonb) returning id as brief_id;",
+        "options": {
+          "queryReplacement": "={{ [$json.conversation_id, $json.booking_id || '', $json.content_markdown, $json.content_blocks_json] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "CREDENTIAL_ID",
+          "name": "postgres (set your own)"
+        }
+      }
+    },
+    {
+      "name": "Send Brief To Agent Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1420,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $('Load Brief Data').item.json.agent_chat_id }}",
+        "text": "={{ $('Assemble Brief').item.json.telegram_text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "CREDENTIAL_ID",
+          "name": "telegramApi (set your own)"
+        }
+      }
+    },
+    {
+      "name": "Send Brief To Agent Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        1660,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "authentication": "oAuth2",
+        "sendTo": "={{ $('Load Brief Data').item.json.agent_email }}",
+        "subject": "={{ $('Assemble Brief').item.json.subject }}",
+        "emailType": "text",
+        "message": "={{ $('Assemble Brief').item.json.content_markdown }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "CREDENTIAL_ID",
+          "name": "gmailOAuth2 (set your own)"
+        }
+      }
+    },
+    {
+      "name": "Has Calendar Event",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1900,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $('Load Brief Data').item.json.booking ? ($('Load Brief Data').item.json.booking.calendar_event_id || '') : '' }}",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "name": "Attach Brief To Calendar Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        2140,
+        -140
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "resource": "event",
+        "operation": "update",
+        "calendar": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $('Load Brief Data').item.json.calendar_id }}"
+        },
+        "eventId": "={{ $('Load Brief Data').item.json.booking.calendar_event_id }}",
+        "useDefaultReminders": true,
+        "updateFields": {
+          "description": "={{ $('Assemble Brief').item.json.calendar_description }}",
+          "sendUpdates": "none"
+        }
+      },
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "CREDENTIAL_ID",
+          "name": "googleCalendarOAuth2Api (set your own)"
+        }
+      }
+    },
+    {
+      "name": "Record Delivery With Event",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2380,
+        -140
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "update lqs.briefs set delivered_to = $2::jsonb where id = $1::uuid returning id as brief_id, delivered_to;",
+        "options": {
+          "queryReplacement": "={{ [$('Insert Brief').item.json.brief_id, JSON.stringify({ telegram: $('Send Brief To Agent Telegram').item.json.error ? 'failed' : 'sent', email: $('Send Brief To Agent Email').item.json.error ? 'failed' : 'sent', calendar: $json.error ? 'failed' : 'sent' })] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "CREDENTIAL_ID",
+          "name": "postgres (set your own)"
+        }
+      }
+    },
+    {
+      "name": "Record Delivery Without Event",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2140,
+        140
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "update lqs.briefs set delivered_to = $2::jsonb where id = $1::uuid returning id as brief_id, delivered_to;",
+        "options": {
+          "queryReplacement": "={{ [$('Insert Brief').item.json.brief_id, JSON.stringify({ telegram: $('Send Brief To Agent Telegram').item.json.error ? 'failed' : 'sent', email: $('Send Brief To Agent Email').item.json.error ? 'failed' : 'sent', calendar: 'skipped' })] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "CREDENTIAL_ID",
+          "name": "postgres (set your own)"
+        }
+      }
+    },
+    {
+      "name": "Return",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        2620,
+        0
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ok",
+              "name": "ok",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "bid",
+              "name": "brief_id",
+              "value": "={{ $json.brief_id }}",
+              "type": "string"
+            },
+            {
+              "id": "dt",
+              "name": "delivered_to",
+              "value": "={{ $json.delivered_to }}",
+              "type": "object"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Workflow Input": {
+      "main": [
+        [
+          {
+            "node": "Load Brief Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Brief Data": {
+      "main": [
+        [
+          {
+            "node": "Write Summary And Watchouts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Summary And Watchouts": {
+      "main": [
+        [
+          {
+            "node": "Assemble Brief",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble Brief": {
+      "main": [
+        [
+          {
+            "node": "Insert Brief",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Brief": {
+      "main": [
+        [
+          {
+            "node": "Send Brief To Agent Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Brief To Agent Telegram": {
+      "main": [
+        [
+          {
+            "node": "Send Brief To Agent Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Brief To Agent Email": {
+      "main": [
+        [
+          {
+            "node": "Has Calendar Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Calendar Event": {
+      "main": [
+        [
+          {
+            "node": "Attach Brief To Calendar Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Delivery Without Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Brief To Calendar Event": {
+      "main": [
+        [
+          {
+            "node": "Record Delivery With Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Delivery With Event": {
+      "main": [
+        [
+          {
+            "node": "Return",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Delivery Without Event": {
+      "main": [
+        [
+          {
+            "node": "Return",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Brief Prose Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Write Summary And Watchouts",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Brief Prose Schema": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Write Summary And Watchouts",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Brief Prose Retry Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Brief Prose Schema",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

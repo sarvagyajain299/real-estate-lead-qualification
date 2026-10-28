@@ -1,0 +1,263 @@
+{
+  "name": "LQS - Channel: send message",
+  "id": "1uHZWNuI2G1IOzVs",
+  "active": true,
+  "versionId": "6ad23222-35b7-492c-84f0-c793ffd9497f",
+  "description": "In: conversation_id, text. Out: { ok, external_message_id }. Looks up the conversation channel and the lead's external id, dispatches on channel (telegram for MVP), and logs the outbound row in lqs.messages. Every reply in the system goes through here.",
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": true,
+    "errorWorkflow": "f2C3GiauR1vJiIxw"
+  },
+  "nodes": [
+    {
+      "id": "e8e19ffb-cf8f-4887-b8bd-6cb5f4e77b5e",
+      "name": "Workflow Input",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "conversation_id",
+              "type": "string"
+            },
+            {
+              "name": "text",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "59493232-4940-4796-ab0b-8532d0e1290a",
+      "name": "Load Channel Target",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "select c.channel as channel, li.external_id as external_id, c.lead_id as lead_id from lqs.conversations c join lqs.lead_identities li on li.lead_id = c.lead_id and li.channel = c.channel where c.id = $1::uuid limit 1;",
+        "options": {
+          "queryReplacement": "={{ [$json.conversation_id] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "CREDENTIAL_ID",
+          "name": "postgres (set your own)"
+        }
+      }
+    },
+    {
+      "id": "ec5f6e17-0039-42e7-bc0e-bae50fd00a72",
+      "name": "Route By Channel",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        440,
+        0
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "outputKey": "telegram",
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.channel }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "telegram"
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "Unsupported"
+        }
+      }
+    },
+    {
+      "id": "65f68348-38a2-498c-92f0-47b235042811",
+      "name": "Send Telegram Message",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        660,
+        -120
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $json.external_id }}",
+        "text": "={{ $('Workflow Input').item.json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "Markdown"
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "CREDENTIAL_ID",
+          "name": "telegramApi (set your own)"
+        }
+      }
+    },
+    {
+      "id": "25c20b45-0c74-4940-9401-06ff51788171",
+      "name": "Log Outbound Message",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        880,
+        -120
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "with ins as (insert into lqs.messages (conversation_id, direction, channel, external_message_id, body, raw, processed_at) values ($1::uuid, 'outbound', $2, $3, $4, $5::jsonb, now()) on conflict do nothing returning id), upd as (update lqs.conversations set last_outbound_at = now(), updated_at = now() where id = $1::uuid returning id) select (select id from ins) as message_row_id, $3 as external_message_id;",
+        "options": {
+          "queryReplacement": "={{ [$('Workflow Input').item.json.conversation_id, $('Load Channel Target').item.json.channel, $('Load Channel Target').item.json.external_id + ':' + ($json.result?.message_id ?? ''), $('Workflow Input').item.json.text, JSON.stringify($json.result ?? {})] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "CREDENTIAL_ID",
+          "name": "postgres (set your own)"
+        }
+      }
+    },
+    {
+      "id": "e37e1535-f101-4bdb-95ca-bfa2c046de5b",
+      "name": "Return",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1100,
+        -120
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ok",
+              "name": "ok",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "emid",
+              "name": "external_message_id",
+              "value": "={{ $json.external_message_id }}",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "55ec5b8e-81c3-43e7-8a0a-7c36638987ca",
+      "name": "Unsupported Channel",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        120
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const ch = $input.first().json.channel;\nthrow new Error('LQS - Channel: send message has no adapter for channel ' + ch);"
+      }
+    }
+  ],
+  "connections": {
+    "Workflow Input": {
+      "main": [
+        [
+          {
+            "node": "Load Channel Target",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Channel Target": {
+      "main": [
+        [
+          {
+            "node": "Route By Channel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route By Channel": {
+      "main": [
+        [
+          {
+            "node": "Send Telegram Message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Unsupported Channel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Telegram Message": {
+      "main": [
+        [
+          {
+            "node": "Log Outbound Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Outbound Message": {
+      "main": [
+        [
+          {
+            "node": "Return",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

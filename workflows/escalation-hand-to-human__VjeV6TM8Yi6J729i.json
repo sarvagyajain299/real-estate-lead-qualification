@@ -1,0 +1,235 @@
+{
+  "name": "LQS - Escalation: hand to human",
+  "id": "VjeV6TM8Yi6J729i",
+  "active": true,
+  "versionId": "1222c92b-51cb-4705-9a69-a0776db3d39f",
+  "description": "In: conversation_id, reason. Out: { ok }. Mutes the bot, marks conversation and lead escalated, delivers a partial brief, alerts the agent on Telegram with the reason and an execution link, and sends the lead one line. Unmuting is a manual database update.",
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": true,
+    "errorWorkflow": "f2C3GiauR1vJiIxw"
+  },
+  "nodes": [
+    {
+      "name": "Workflow Input",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "conversation_id",
+              "type": "string"
+            },
+            {
+              "name": "reason",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Mute And Escalate",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        240,
+        0
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "with uc as (update lqs.conversations set bot_muted = true, status = 'escalated', escalation_reason = $2, updated_at = now() where id = $1::uuid returning id, lead_id, market_id, language), ul as (update lqs.leads set status = 'escalated', updated_at = now() where id = (select lead_id from uc) returning id, full_name) select (select id from uc) as conversation_id, (select full_name from ul) as lead_name, a.telegram_chat_id as agent_chat_id, a.full_name as agent_name, coalesce(m.disclaimers->'handover_line'->>coalesce((select language from uc), 'en'), m.disclaimers->'handover_line'->>'en', 'Thanks - I have passed this to our agent, and they will follow up with you directly.') as lead_line from lqs.markets m join lqs.agents a on a.market_id = m.id and a.active where m.id = (select market_id from uc) order by a.created_at limit 1;",
+        "options": {
+          "queryReplacement": "={{ [$json.conversation_id, $json.reason] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "CREDENTIAL_ID",
+          "name": "postgres (set your own)"
+        }
+      }
+    },
+    {
+      "name": "Deliver Partial Brief",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        480,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "mode": "each",
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "WrLLLmNkBCycCyZH",
+          "cachedResultName": "LQS - Brief: generate and deliver"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": [],
+          "value": {
+            "conversation_id": "={{ $('Workflow Input').item.json.conversation_id }}",
+            "booking_id": ""
+          }
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "name": "Alert Agent",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        720,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $('Mute And Escalate').item.json.agent_chat_id }}",
+        "text": "=Conversation escalated to you\nLead: {{ String($('Mute And Escalate').item.json.lead_name || 'unnamed').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;') }}\nReason: {{ String($('Workflow Input').item.json.reason || 'unknown').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;') }}\nConversation id: {{ $('Workflow Input').item.json.conversation_id }}\nThe bot is now muted on this conversation. Brief sent separately.\nhttps://YOUR_N8N_HOST/workflow/{{ $workflow.id }}/executions/{{ $execution.id }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "CREDENTIAL_ID",
+          "name": "telegramApi (set your own)"
+        }
+      }
+    },
+    {
+      "name": "Tell Lead A Human Is Coming",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        960,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "mode": "each",
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "1uHZWNuI2G1IOzVs",
+          "cachedResultName": "LQS - Channel: send message"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": [],
+          "value": {
+            "conversation_id": "={{ $('Workflow Input').item.json.conversation_id }}",
+            "text": "={{ $('Mute And Escalate').item.json.lead_line }}"
+          }
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "name": "Return",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1200,
+        0
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ok",
+              "name": "ok",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "reason",
+              "name": "reason",
+              "value": "={{ $('Workflow Input').item.json.reason }}",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Workflow Input": {
+      "main": [
+        [
+          {
+            "node": "Mute And Escalate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mute And Escalate": {
+      "main": [
+        [
+          {
+            "node": "Deliver Partial Brief",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deliver Partial Brief": {
+      "main": [
+        [
+          {
+            "node": "Alert Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert Agent": {
+      "main": [
+        [
+          {
+            "node": "Tell Lead A Human Is Coming",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tell Lead A Human Is Coming": {
+      "main": [
+        [
+          {
+            "node": "Return",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

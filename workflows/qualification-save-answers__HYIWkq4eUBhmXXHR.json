@@ -1,0 +1,184 @@
+{
+  "name": "LQS - Qualification: save answers",
+  "id": "HYIWkq4eUBhmXXHR",
+  "active": true,
+  "versionId": "ef11920d-5d61-44cb-a14d-f16113043b59",
+  "description": "Stateful. In: conversation_id, slots_json. Out: { ok, saved, conflicts }. Upserts one row per slot; a materially different value on an already filled slot pushes the old value into previous_values and marks the slot conflicted. Contact is additive.",
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": true,
+    "errorWorkflow": "f2C3GiauR1vJiIxw"
+  },
+  "nodes": [
+    {
+      "id": "42bd8c94-2b9d-4d54-a1fb-04fb9e178cda",
+      "name": "Workflow Input",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "conversation_id",
+              "type": "string"
+            },
+            {
+              "name": "slots_json",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "846ead1d-6a58-4ac3-9689-59286d4bc16f",
+      "name": "Load Current Slot State",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        240,
+        0
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "select sd.slot_key as slot_key, sd.value_type as value_type, q.value as current_value, q.state as current_state, coalesce(q.previous_values, '[]'::jsonb) as previous_values, m.currency as market_currency, m.fx_rates as fx_rates, l.full_name as lead_full_name from lqs.conversations c join lqs.leads l on l.id = c.lead_id join lqs.markets m on m.id = c.market_id join lqs.slot_definitions sd on sd.market_id = c.market_id and sd.deal_type = c.deal_type left join lqs.qualification q on q.conversation_id = c.id and q.slot_key = sd.slot_key where c.id = $1::uuid;",
+        "options": {
+          "queryReplacement": "={{ [$json.conversation_id] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "CREDENTIAL_ID",
+          "name": "postgres (set your own)"
+        }
+      }
+    },
+    {
+      "id": "e8ffded5-4932-442b-81b7-a7af67851107",
+      "name": "Plan Upserts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const input = $('Workflow Input').first().json;\nlet incoming = [];\ntry { incoming = JSON.parse(input.slots_json || '[]'); } catch (e) { incoming = []; }\nif (!Array.isArray(incoming)) incoming = [];\n\nconst rows = $input.all().map(function (i) { return i.json; });\nconst defs = {};\nfor (const r of rows) { defs[r.slot_key] = r; }\n\nconst marketCurrency = ((rows[0] && rows[0].market_currency) || 'AED').toUpperCase();\nconst fxRates = (rows[0] && rows[0].fx_rates) || {};\nconst leadFullName = String((rows[0] && rows[0].lead_full_name) || '').trim();\n\n// A lead may quote any currency. Normalise to the market currency before anything\n// downstream compares it against a threshold or searches listings with it. What they\n// actually said is kept under `original` so the brief can quote them.\nfunction normaliseMoney(v) {\n  if (!v || typeof v !== 'object' || Array.isArray(v)) return v;\n  const raw = (typeof v.currency === 'string' && v.currency) ? v.currency.toUpperCase() : marketCurrency;\n  if (raw === marketCurrency) {\n    const same = Object.assign({}, v);\n    same.currency = marketCurrency;\n    return same;\n  }\n  const rate = Number(fxRates[raw]);\n  if (!isFinite(rate) || rate <= 0) {\n    const unknown = Object.assign({}, v);\n    unknown.currency = raw;\n    unknown.fx_applied = false;\n    return unknown;\n  }\n  const conv = { currency: marketCurrency, fx_applied: true, original: { currency: raw } };\n  if (typeof v.min === 'number') { conv.min = Math.round(v.min * rate); conv.original.min = v.min; }\n  if (typeof v.max === 'number') { conv.max = Math.round(v.max * rate); conv.original.max = v.max; }\n  return conv;\n}\n\nfunction materiallyDifferent(type, oldV, newV) {\n  if (oldV === null || oldV === undefined) return false;\n  if (type === 'currency_range') {\n    const a = (oldV && typeof oldV === 'object') ? oldV : {};\n    const b = (newV && typeof newV === 'object') ? newV : {};\n    const aMin = typeof a.min === 'number' ? a.min : 0;\n    const aMax = typeof a.max === 'number' ? a.max : Number.MAX_SAFE_INTEGER;\n    const bMin = typeof b.min === 'number' ? b.min : 0;\n    const bMax = typeof b.max === 'number' ? b.max : Number.MAX_SAFE_INTEGER;\n    return !(aMin <= bMax && bMin <= aMax);\n  }\n  if (type === 'contact') return false;\n  if (type === 'number') return Number(oldV) !== Number(newV);\n  if (type === 'enum' || type === 'text' || type === 'date') return String(oldV) !== String(newV);\n  return JSON.stringify(oldV) !== JSON.stringify(newV);\n}\n\nfunction mergeContact(oldV, newV) {\n  const o = (oldV && typeof oldV === 'object' && !Array.isArray(oldV)) ? oldV : {};\n  const n = (newV && typeof newV === 'object' && !Array.isArray(newV)) ? newV : {};\n  const merged = Object.assign({}, o);\n  const keys = ['full_name', 'phone', 'email'];\n  for (const k of keys) {\n    if (typeof n[k] === 'string' && n[k].trim().length > 0) merged[k] = n[k].trim();\n  }\n  // The bot no longer asks for a name the channel already gave us, so the lead\n  // will often send back a bare number. Fall back to the display name.\n  if (!merged.full_name && leadFullName) merged.full_name = leadFullName;\n  return merged;\n}\n\nconst plan = [];\nfor (const s of incoming) {\n  if (!s || typeof s.slot_key !== 'string') continue;\n  const def = defs[s.slot_key];\n  if (!def) continue;\n  const type = def.value_type;\n  let value = s.value;\n  let state = 'filled';\n  const prev = Array.isArray(def.previous_values) ? def.previous_values.slice() : [];\n\n  if (type === 'currency_range') {\n    value = normaliseMoney(value);\n  }\n\n  if (type === 'contact') {\n    value = mergeContact(def.current_value, value);\n  } else if (def.current_state === 'filled' && def.current_value !== null && def.current_value !== undefined) {\n    if (materiallyDifferent(type, def.current_value, value)) {\n      prev.push(def.current_value);\n      state = 'conflicted';\n    }\n  }\n  plan.push({ slot_key: s.slot_key, value: value, state: state, previous_values: prev });\n}\n\nreturn [{ json: { conversation_id: input.conversation_id, plan_json: JSON.stringify(plan) } }];"
+      }
+    },
+    {
+      "id": "57a70f8b-edb8-473d-b0ee-90f64e07745d",
+      "name": "Apply Upserts",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        720,
+        0
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "with upserted as (insert into lqs.qualification (conversation_id, slot_key, value, state, previous_values, updated_at) select $1::uuid, x.slot_key, x.value, x.state, x.previous_values, now() from jsonb_to_recordset($2::jsonb) as x(slot_key text, value jsonb, state text, previous_values jsonb) on conflict (conversation_id, slot_key) do update set value = excluded.value, state = excluded.state, previous_values = excluded.previous_values, updated_at = now() returning slot_key, state, value), lead_sync as (update lqs.leads l set full_name = coalesce(nullif(l.full_name, ''), nullif(u.value->>'full_name', '')), phone = coalesce(nullif(l.phone, ''), nullif(u.value->>'phone', '')), email = coalesce(nullif(l.email, ''), nullif(case when u.value->>'email' like '%_@_%._%' then lower(u.value->>'email') end, '')), updated_at = now() from upserted u, lqs.conversations c where u.slot_key = 'contact' and c.id = $1::uuid and l.id = c.lead_id returning l.id) select coalesce((select json_agg(json_build_object('slot_key', slot_key, 'state', state)) from upserted), '[]'::json) as results;",
+        "options": {
+          "queryReplacement": "={{ [$json.conversation_id, $json.plan_json] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "CREDENTIAL_ID",
+          "name": "postgres (set your own)"
+        }
+      }
+    },
+    {
+      "id": "bffe0e88-48aa-4d0d-a91b-553c8ce8a550",
+      "name": "Return",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        960,
+        0
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ok",
+              "name": "ok",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "saved",
+              "name": "saved",
+              "value": "={{ ($json.results || []).map(r => r.slot_key) }}",
+              "type": "array"
+            },
+            {
+              "id": "conf",
+              "name": "conflicts",
+              "value": "={{ ($json.results || []).filter(r => r.state === 'conflicted').map(r => r.slot_key) }}",
+              "type": "array"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Workflow Input": {
+      "main": [
+        [
+          {
+            "node": "Load Current Slot State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Current Slot State": {
+      "main": [
+        [
+          {
+            "node": "Plan Upserts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan Upserts": {
+      "main": [
+        [
+          {
+            "node": "Apply Upserts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Upserts": {
+      "main": [
+        [
+          {
+            "node": "Return",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

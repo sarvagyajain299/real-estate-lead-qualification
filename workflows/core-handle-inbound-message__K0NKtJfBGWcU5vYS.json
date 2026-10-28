@@ -1,0 +1,2219 @@
+{
+  "id": "K0NKtJfBGWcU5vYS",
+  "name": "LQS - Core: handle inbound message",
+  "description": "The supervisor ladder, section 5 of the spec. Persist, debounce, lock, muted check, extract, save, escalation check, question detour, decide, re-check before speaking, send. Every flow-control decision in the system lives here and nowhere else.",
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": true,
+    "errorWorkflow": "f2C3GiauR1vJiIxw",
+    "executionTimeout": 300
+  },
+  "nodes": [
+    {
+      "id": "a386c3c3-322b-4afe-935f-35a268cbaf9d",
+      "name": "Workflow Input",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "channel",
+              "type": "string"
+            },
+            {
+              "name": "external_id",
+              "type": "string"
+            },
+            {
+              "name": "external_message_id",
+              "type": "string"
+            },
+            {
+              "name": "text",
+              "type": "string"
+            },
+            {
+              "name": "display_name",
+              "type": "string"
+            },
+            {
+              "name": "timestamp",
+              "type": "string"
+            },
+            {
+              "name": "raw_json",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "1aa131cf-1107-4409-b02f-f4a03e548eb2",
+      "name": "Resolve Identity",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "mode": "each",
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "sC0lt9OPiKgENGAz",
+          "cachedResultName": "LQS - Lead: resolve identity"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": [],
+          "value": {
+            "channel": "={{ $json.channel }}",
+            "external_id": "={{ $json.external_id }}",
+            "display_name": "={{ $json.display_name }}",
+            "market_code": "AE"
+          }
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "dc63f7aa-381b-4a3c-a3f4-e998af447cc6",
+      "name": "Persist Message",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        440,
+        0
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "with ins as (insert into lqs.messages (conversation_id, direction, channel, external_message_id, body, raw, created_at) values ($1::uuid, 'inbound', $2, $3, $4, $5::jsonb, now()) on conflict do nothing returning id), touch as (update lqs.conversations set last_inbound_at = now(), updated_at = now() where id = $1::uuid and exists (select 1 from ins) returning id) select coalesce((select id from ins)::text, '') as message_id, (select count(*) from ins)::int as inserted, coalesce((m.buffer_seconds->>$2)::int, 5) as buffer_seconds, (m.thresholds->>'lock_seconds')::int as lock_seconds, (m.thresholds->>'slot_max_attempts')::int as slot_max_attempts, c.market_id as market_id from lqs.conversations c join lqs.markets m on m.id = c.market_id where c.id = $1::uuid;",
+        "options": {
+          "queryReplacement": "={{ [$json.conversation_id, $('Workflow Input').item.json.channel, $('Workflow Input').item.json.external_message_id, $('Workflow Input').item.json.text, $('Workflow Input').item.json.raw_json || '{}'] }}"
+        }
+      }
+    },
+    {
+      "id": "3adeabf7-ea9c-41e3-b8c6-7c1047f553ff",
+      "name": "Is Duplicate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        660,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.inserted }}",
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              },
+              "rightValue": 0
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "ff4843ad-ed3b-4857-85e1-d658a0f6c842",
+      "name": "Return Duplicate",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        880,
+        -260
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ok",
+              "name": "ok",
+              "value": false,
+              "type": "boolean"
+            },
+            {
+              "id": "err",
+              "name": "error",
+              "value": "duplicate_message",
+              "type": "string"
+            },
+            {
+              "id": "act",
+              "name": "action",
+              "value": "none",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "20d24c4a-ee5d-46f8-af80-03cea6302eca",
+      "name": "Debounce",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        880,
+        0
+      ],
+      "parameters": {
+        "resume": "timeInterval",
+        "amount": "={{ $json.buffer_seconds }}",
+        "unit": "seconds"
+      },
+      "webhookId": "b33058c5-cb02-41cd-8fd7-88f40c8dbe55"
+    },
+    {
+      "id": "7f3ae89f-676c-4df4-a965-a1b313b79d84",
+      "name": "Check Gate",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1100,
+        0
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "with conv as (select * from lqs.conversations where id = $1::uuid), newest as (select id from lqs.messages where conversation_id = $1::uuid and direction = 'inbound' order by created_at desc, id desc limit 1), decision as (select case when (select id from newest)::text <> $2 then 'superseded' when (select bot_muted from conv) then 'muted' when (select processing_until from conv) is not null and (select processing_until from conv) > now() then 'locked' else 'proceed' end as gate), take_lock as (update lqs.conversations set processing_until = now() + make_interval(secs => $3::int), updated_at = now() where id = $1::uuid and (select gate from decision) = 'proceed' returning id), mark_muted as (update lqs.messages set processed_at = now() where conversation_id = $1::uuid and direction = 'inbound' and processed_at is null and (select gate from decision) = 'muted' returning id) select (select gate from decision) as gate;",
+        "options": {
+          "queryReplacement": "={{ [$('Resolve Identity').item.json.conversation_id, $('Persist Message').item.json.message_id, $('Persist Message').item.json.lock_seconds] }}"
+        }
+      }
+    },
+    {
+      "id": "ad77a8e1-072f-46c1-9642-7023284a8f2d",
+      "name": "Route Gate",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1320,
+        0
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "outputKey": "superseded",
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.gate }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "superseded"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "outputKey": "locked",
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.gate }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "locked"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "outputKey": "muted",
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.gate }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "muted"
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "proceed"
+        }
+      }
+    },
+    {
+      "id": "f82fd1dd-6701-4810-81c9-e8f6376db3cb",
+      "name": "Return Superseded",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1540,
+        -400
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ok",
+              "name": "ok",
+              "value": false,
+              "type": "boolean"
+            },
+            {
+              "id": "err",
+              "name": "error",
+              "value": "superseded",
+              "type": "string"
+            },
+            {
+              "id": "act",
+              "name": "action",
+              "value": "none",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "c5293e30-fb6e-420d-ab6b-9bb03de5e892",
+      "name": "Return Locked",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1540,
+        -260
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ok",
+              "name": "ok",
+              "value": false,
+              "type": "boolean"
+            },
+            {
+              "id": "err",
+              "name": "error",
+              "value": "conversation_locked",
+              "type": "string"
+            },
+            {
+              "id": "act",
+              "name": "action",
+              "value": "none",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "1c9b8774-7d9b-463e-ade5-a7e56c37db4e",
+      "name": "Return Logged Only",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1540,
+        -120
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ok",
+              "name": "ok",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "act",
+              "name": "action",
+              "value": "logged_only",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "af7319e7-eead-43f1-bda2-d46de071c98c",
+      "name": "Gather Unprocessed Messages",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1540,
+        40
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "select (select coalesce(string_agg(mm.body, chr(10) order by mm.created_at), '') from lqs.messages mm where mm.conversation_id = c.id and mm.direction = 'inbound' and mm.processed_at is null) as combined_text, (select coalesce(json_agg(t.j order by t.created_at), '[]'::json) from (select json_build_object('direction', direction, 'body', body) as j, created_at from lqs.messages where conversation_id = c.id order by created_at desc limit 6) t) as history, (select coalesce(json_agg(json_build_object('slot_key', sd.slot_key, 'value_type', sd.value_type, 'extraction_hint', sd.extraction_hint, 'choices', case when sd.value_type = 'enum' then (select coalesce(json_agg(ch->>'value'), '[]'::json) from jsonb_array_elements(coalesce(sd.question_choices, '[]'::jsonb)) ch) else '[]'::json end) order by sd.priority), '[]'::json) from lqs.slot_definitions sd where sd.market_id = c.market_id and sd.deal_type = c.deal_type and sd.active) as applicable_slots, (select coalesce(json_object_agg(q.slot_key, q.value), '{}'::json) from lqs.qualification q where q.conversation_id = c.id and q.state in ('filled', 'conflicted') and q.value is not null) as filled_values, c.language as language, c.market_id as market_id, c.deal_type as deal_type, coalesce(l.timezone, m.timezone) as lead_tz, m.disclaimers as lines, (select to_char(bk.starts_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') from lqs.bookings bk where bk.conversation_id = c.id and bk.status = 'confirmed' order by bk.created_at desc limit 1) as confirmed_starts_at from lqs.conversations c join lqs.leads l on l.id = c.lead_id join lqs.markets m on m.id = c.market_id where c.id = $1::uuid;",
+        "options": {
+          "queryReplacement": "={{ [$('Resolve Identity').item.json.conversation_id] }}"
+        }
+      }
+    },
+    {
+      "id": "14d76d78-b449-49a8-93e5-b9f1942df5de",
+      "name": "Extract Facts",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        1760,
+        40
+      ],
+      "parameters": {
+        "mode": "each",
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "FDtQFdAlFwsguA6v",
+          "cachedResultName": "LQS - Subworkflow: extract facts"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": [],
+          "value": {
+            "text": "={{ $json.combined_text }}",
+            "history_json": "={{ JSON.stringify($json.history) }}",
+            "applicable_slots_json": "={{ JSON.stringify($json.applicable_slots) }}",
+            "filled_values_json": "={{ JSON.stringify($json.filled_values) }}",
+            "language_hint": "={{ $json.language || 'en' }}"
+          }
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "059a7c1f-845f-4edd-b38d-2f99a630634e",
+      "name": "Save Answers",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        1980,
+        40
+      ],
+      "parameters": {
+        "mode": "each",
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "HYIWkq4eUBhmXXHR",
+          "cachedResultName": "LQS - Qualification: save answers"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": [],
+          "value": {
+            "conversation_id": "={{ $('Resolve Identity').item.json.conversation_id }}",
+            "slots_json": "={{ JSON.stringify($json.slots || []) }}"
+          }
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "29d29727-572f-44a6-abb9-020c7caab7b9",
+      "name": "Update Streaks",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2200,
+        40
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "with b as (select exists(select 1 from lqs.bookings bk where bk.conversation_id = $1::uuid and bk.status = 'offered') as awaiting), upd as (update lqs.conversations set unparsed_streak = case when (select awaiting from b) then unparsed_streak when $2::boolean then unparsed_streak + 1 else 0 end, repeat_streak = case when (select awaiting from b) then repeat_streak when $3::boolean then repeat_streak + 1 else 0 end, language = coalesce(language, nullif($4, '')), updated_at = now() where id = $1::uuid returning id, market_id, unparsed_streak, repeat_streak, language) select upd.unparsed_streak as unparsed_streak, upd.repeat_streak as repeat_streak, upd.language as language, m.thresholds as thresholds, (select q.value from lqs.qualification q where q.conversation_id = upd.id and q.slot_key = 'budget') as budget, (select q.value from lqs.qualification q where q.conversation_id = upd.id and q.slot_key = 'payment_method') as payment_method, (select awaiting from b) as awaiting_slot_choice from upd join lqs.markets m on m.id = upd.market_id;",
+        "options": {
+          "queryReplacement": "={{ [$('Resolve Identity').item.json.conversation_id, ($('Extract Facts').item.json.unparseable === true || $('Extract Facts').item.json.ok === false), $('Extract Facts').item.json.is_repeat_of_previous === true, $('Extract Facts').item.json.language || ''] }}"
+        }
+      }
+    },
+    {
+      "id": "8777924f-7c6b-4eb5-8927-d08e41c2d167",
+      "name": "Escalation Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2420,
+        40
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const s = $input.first().json;\nconst ex = $('Extract Facts').first().json;\nconst th = s.thresholds || {};\nconst reasons = [];\n\nconst intent = ex.intent || 'unclear';\nif (intent === 'request_human') reasons.push('request_human');\n\nconst unparsedLimit = typeof th.escalate_unparsed_streak === 'number' ? th.escalate_unparsed_streak : 2;\nconst repeatLimit = typeof th.escalate_repeat_streak === 'number' ? th.escalate_repeat_streak : 2;\nif ((s.unparsed_streak || 0) >= unparsedLimit) reasons.push('unparsed_streak');\nif ((s.repeat_streak || 0) >= repeatLimit) reasons.push('repeat_streak');\n\nconst budget = s.budget;\nconst budgetMin = (budget && typeof budget === 'object' && typeof budget.min === 'number') ? budget.min : null;\nconst pm = s.payment_method === null || s.payment_method === undefined ? null : String(s.payment_method);\nconst highValueMin = typeof th.escalate_high_value_min_budget === 'number' ? th.escalate_high_value_min_budget : null;\nconst highValueMethods = Array.isArray(th.escalate_high_value_payment_methods) ? th.escalate_high_value_payment_methods : [];\nif (budgetMin !== null && highValueMin !== null && budgetMin >= highValueMin && pm !== null && highValueMethods.indexOf(pm) !== -1) {\n  reasons.push('high_value');\n}\n\nreturn [{ json: {\n  escalate: reasons.length > 0,\n  reason: reasons.join(','),\n  intent: intent,\n  question_text: ex.question_text || ''\n} }];"
+      }
+    },
+    {
+      "id": "542a2cf9-fe62-40a7-abdd-f96bb0cafe18",
+      "name": "Should Escalate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2640,
+        40
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.escalate }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "dedb01f4-6830-4063-95b2-d3763ce214f0",
+      "name": "Escalate To Human",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        2860,
+        -160
+      ],
+      "parameters": {
+        "mode": "each",
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "VjeV6TM8Yi6J729i",
+          "cachedResultName": "LQS - Escalation: hand to human"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": [],
+          "value": {
+            "conversation_id": "={{ $('Resolve Identity').item.json.conversation_id }}",
+            "reason": "={{ $json.reason }}"
+          }
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "c5246b5c-74d7-4499-b3c2-13c87fa3c7d3",
+      "name": "Clear Lock After Escalation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        3080,
+        -160
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "with mark as (update lqs.messages set processed_at = now() where conversation_id = $1::uuid and direction = 'inbound' and processed_at is null returning id) update lqs.conversations set processing_until = null, updated_at = now() where id = $1::uuid returning (select count(*) from mark)::int as marked;",
+        "options": {
+          "queryReplacement": "={{ [$('Resolve Identity').item.json.conversation_id] }}"
+        }
+      }
+    },
+    {
+      "id": "ac123d44-7be0-4ed9-a0c3-68e790e65fc6",
+      "name": "Return Escalated",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        3300,
+        -160
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ok",
+              "name": "ok",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "act",
+              "name": "action",
+              "value": "escalated",
+              "type": "string"
+            },
+            {
+              "id": "r",
+              "name": "reason",
+              "value": "={{ $('Escalation Check').item.json.reason }}",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "e3e8b54d-3109-43c8-950b-0e4e8fc93f36",
+      "name": "Is Question",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2860,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.intent }}",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              },
+              "rightValue": "question"
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "dae8c6df-50d0-4348-9222-60a7688096bd",
+      "name": "Answer Question",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        3080,
+        120
+      ],
+      "parameters": {
+        "mode": "each",
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "necx1vepzlBnd58Q",
+          "cachedResultName": "LQS - Listings: answer question"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": [],
+          "value": {
+            "conversation_id": "={{ $('Resolve Identity').item.json.conversation_id }}",
+            "question_text": "={{ $('Escalation Check').item.json.question_text || $('Gather Unprocessed Messages').item.json.combined_text }}",
+            "language": "={{ $('Gather Unprocessed Messages').item.json.language || 'en' }}",
+            "market_id": "={{ $('Gather Unprocessed Messages').item.json.market_id }}",
+            "filled_values_json": "={{ JSON.stringify($('Gather Unprocessed Messages').item.json.filled_values) }}"
+          }
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "47a20491-3b71-4402-bf40-e9ca3931fea7",
+      "name": "Decide Next Step",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        3300,
+        200
+      ],
+      "parameters": {
+        "mode": "each",
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "hpe6dyktPusHzO8O",
+          "cachedResultName": "LQS - Qualification: decide next step"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": [],
+          "value": {
+            "conversation_id": "={{ $('Resolve Identity').item.json.conversation_id }}",
+            "intent": "={{ $('Escalation Check').item.json.intent }}"
+          }
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "98658cca-2b9d-4d22-a14c-4de2cf92a8dd",
+      "name": "Route Action",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        3520,
+        200
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "outputKey": "ask",
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "ask_slot"
+                  },
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "resolve_conflict"
+                  }
+                ],
+                "combinator": "or"
+              }
+            },
+            {
+              "outputKey": "offer",
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "offer_booking"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "outputKey": "confirm",
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "confirm_booking"
+                  },
+                  {
+                    "leftValue": "={{ $json.variant }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "notEquals"
+                    },
+                    "rightValue": "already_booked"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "outputKey": "already",
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "confirm_booking"
+                  },
+                  {
+                    "leftValue": "={{ $json.variant }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "already_booked"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "outputKey": "nurture",
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "nurture"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "outputKey": "reoffer",
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "reoffer_booking"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "outputKey": "decline",
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "acknowledge_decline"
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "cannot_decide"
+        }
+      }
+    },
+    {
+      "id": "98e30f3f-b8df-46db-869a-75251144d665",
+      "name": "Assemble Ask Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3960,
+        -320
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const cfg = $('Gather Unprocessed Messages').first().json;\nconst d = $('Decide Next Step').first().json;\nconst nl = String.fromCharCode(10);\n\nlet answerText = '';\nlet grounded = false;\ntry {\n  const a = $('Answer Question').first().json;\n  answerText = a.answer_text || '';\n  grounded = a.grounded === true;\n} catch (e) { answerText = ''; grounded = false; }\n\nconst history = Array.isArray(cfg.history) ? cfg.history : [];\n// The composer has to know it is opening a conversation, or it treats \"hi\" as\n// an answer to something and reaches for wording written for a lead who arrived\n// already talking about a project.\nconst isFirstTurn = history.filter(function (h) { return h && h.direction === 'outbound'; }).length === 0;\n\nconst filled = (cfg.filled_values && typeof cfg.filled_values === 'object') ? cfg.filled_values : {};\nconst namedContext = String(filled.project_interest || '');\n\n// The budget on file is a widened search band, not what the lead said, so only\n// their own words are ever put in front of the composer.\nconst known = {};\nfor (const k of Object.keys(filled)) {\n  const v = filled[k];\n  if (k === 'budget' && v && typeof v === 'object') { known[k] = v.stated_text ? v.stated_text : 'already given'; }\n  else if (v && typeof v === 'object') { known[k] = JSON.stringify(v); }\n  else { known[k] = v; }\n}\n\nconst question = String(d.question_text || '').trim();\n\nreturn [{ json: {\n  action: d.action || 'ask_slot',\n  goal: String(d.goal || question),\n  facts_json: '[]',\n  known_json: JSON.stringify(known),\n  is_first_turn: isFirstTurn,\n  lead_named_context: namedContext,\n  answer_text: answerText,\n  grounded: grounded,\n  choices_json: d.choices_json || '[]',\n  variant: d.variant || '',\n  history_json: JSON.stringify(history),\n  language: cfg.language || 'en',\n  lead_last_message: cfg.combined_text || '',\n  fallback_text: (answerText ? answerText + nl + nl : '') + question,\n  slot_key: d.slot_key || '',\n  asked_slot: true\n} }];"
+      }
+    },
+    {
+      "id": "06dbb35e-786b-4151-a656-3ff289f68a79",
+      "name": "Recheck Newest Message",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        4840,
+        300
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "select case when (select mm.id from lqs.messages mm where mm.conversation_id = $1::uuid and mm.direction = 'inbound' order by mm.created_at desc, mm.id desc limit 1)::text = $6 then 'ok' else 'superseded' end as gate, $2::text as reply_text, $3::text as slot_key, $4::boolean as asked_slot, $5::text as action;",
+        "options": {
+          "queryReplacement": "={{ [$('Resolve Identity').item.json.conversation_id, $json.reply_text, $json.slot_key || '', $json.asked_slot === true, $json.action, $('Persist Message').item.json.message_id] }}"
+        }
+      }
+    },
+    {
+      "id": "7b276459-0190-4ea1-8419-716458fd8eb5",
+      "name": "Offer Slots",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        3740,
+        -120
+      ],
+      "parameters": {
+        "mode": "each",
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YyN9d1h9K66UBKU5",
+          "cachedResultName": "LQS - Booking: offer slots"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": [],
+          "value": {
+            "conversation_id": "={{ $('Resolve Identity').item.json.conversation_id }}",
+            "agent_id": ""
+          }
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "056113ab-c8f3-4f7b-872f-f3fae27344bb",
+      "name": "Slots Found",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3960,
+        -120
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.ok }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "725a5a29-0d48-4717-84a3-90fea10dcc69",
+      "name": "Assemble Offer Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4180,
+        -120
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const cfg = $('Gather Unprocessed Messages').first().json;\nconst d = $('Decide Next Step').first().json;\nconst r = $input.first().json;\nconst lines = cfg.lines || {};\nconst lang = cfg.language || 'en';\nconst nl = String.fromCharCode(10);\nfunction line(key, fallback) { const l = lines[key] || {}; return l[lang] || l.en || fallback; }\n\nlet answerText = '';\nlet grounded = false;\ntry {\n  const a = $('Answer Question').first().json;\n  answerText = a.answer_text || '';\n  grounded = a.grounded === true;\n} catch (e) { answerText = ''; grounded = false; }\n\nconst history = Array.isArray(cfg.history) ? cfg.history : [];\nconst isFirstTurn = history.filter(function (h) { return h && h.direction === 'outbound'; }).length === 0;\n\nconst filled = (cfg.filled_values && typeof cfg.filled_values === 'object') ? cfg.filled_values : {};\nconst namedContext = String(filled.project_interest || '');\nconst known = {};\nfor (const k of Object.keys(filled)) {\n  const v = filled[k];\n  if (k === 'budget' && v && typeof v === 'object') { known[k] = v.stated_text ? v.stated_text : 'already given'; }\n  else if (v && typeof v === 'object') { known[k] = JSON.stringify(v); }\n  else { known[k] = v; }\n}\n\nconst slots = Array.isArray(r.slots) ? r.slots : [];\n// The labels are the only quotable things here. The composer must reproduce\n// them character for character or Validate Reply drops back to the template.\nconst labels = slots.map(function (s) { return String(s.label_local || ''); }).filter(function (l) { return l.length > 0; });\nconst listed = labels.map(function (l, i) { return (i + 1) + '. ' + l; }).join(nl);\nconst fallback = (answerText ? answerText + nl + nl : '') + line('offer_line', 'Here are the next few times the agent is free:') + nl + listed + nl + line('offer_prompt_line', 'Just tell me which one suits you.');\n\nconst action = (d.action === 'reoffer_booking') ? 'reoffer_booking' : 'offer_booking';\n\nreturn [{ json: {\n  action: action,\n  goal: String(d.goal || 'offer the times listed and ask which one suits them'),\n  facts_json: JSON.stringify(labels),\n  known_json: JSON.stringify(known),\n  is_first_turn: isFirstTurn,\n  lead_named_context: namedContext,\n  answer_text: answerText,\n  grounded: grounded,\n  choices_json: '[]',\n  variant: d.variant || '',\n  history_json: JSON.stringify(history),\n  language: lang,\n  lead_last_message: cfg.combined_text || '',\n  fallback_text: fallback,\n  slot_key: '',\n  asked_slot: false\n} }];"
+      }
+    },
+    {
+      "id": "65713201-19e1-419f-b7d3-30066db770c4",
+      "name": "Escalate No Slots",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        4180,
+        60
+      ],
+      "parameters": {
+        "mode": "each",
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "VjeV6TM8Yi6J729i",
+          "cachedResultName": "LQS - Escalation: hand to human"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": [],
+          "value": {
+            "conversation_id": "={{ $('Resolve Identity').item.json.conversation_id }}",
+            "reason": "no_slots"
+          }
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "6cab9abd-b1da-4b41-846c-14e1387c659e",
+      "name": "Clear Lock After No Slots",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        4400,
+        60
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "with mark as (update lqs.messages set processed_at = now() where conversation_id = $1::uuid and direction = 'inbound' and processed_at is null returning id) update lqs.conversations set processing_until = null, updated_at = now() where id = $1::uuid returning (select count(*) from mark)::int as marked;",
+        "options": {
+          "queryReplacement": "={{ [$('Resolve Identity').item.json.conversation_id] }}"
+        }
+      }
+    },
+    {
+      "id": "6813a3de-478c-4a4e-ac52-5a4adaf1d1ce",
+      "name": "Return Handover No Slots",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        4620,
+        60
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ok",
+              "name": "ok",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "act",
+              "name": "action",
+              "value": "handover_no_slots",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "a2de3285-717c-40ed-a4a3-efc3d298b256",
+      "name": "Confirm Booking",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        3740,
+        200
+      ],
+      "parameters": {
+        "mode": "each",
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "jHZl26o8Ra4xnWPh",
+          "cachedResultName": "LQS - Booking: confirm"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": [],
+          "value": {
+            "conversation_id": "={{ $('Resolve Identity').item.json.conversation_id }}",
+            "chosen_slot_utc": "={{ $json.chosen_slot_utc }}"
+          }
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "10f2951e-82fb-4005-b9f6-9774aaf7854c",
+      "name": "Booking Confirmed",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3960,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.ok }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "705f1bfe-c229-42d5-ae87-7e6ff0624da8",
+      "name": "Generate Brief",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        4180,
+        240
+      ],
+      "parameters": {
+        "mode": "each",
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "WrLLLmNkBCycCyZH",
+          "cachedResultName": "LQS - Brief: generate and deliver"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": [],
+          "value": {
+            "conversation_id": "={{ $('Resolve Identity').item.json.conversation_id }}",
+            "booking_id": "={{ $('Confirm Booking').item.json.booking_id }}"
+          }
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "d3c03fdb-6fbe-457b-8443-1088ed689faa",
+      "name": "Assemble Booked Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4400,
+        240
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const cfg = $('Gather Unprocessed Messages').first().json;\nconst d = $('Decide Next Step').first().json;\nconst lines = cfg.lines || {};\nconst lang = cfg.language || 'en';\nconst nl = String.fromCharCode(10);\nfunction line(key, fallback) { const l = lines[key] || {}; return l[lang] || l.en || fallback; }\n\nlet answerText = '';\nlet grounded = false;\ntry {\n  const a = $('Answer Question').first().json;\n  answerText = a.answer_text || '';\n  grounded = a.grounded === true;\n} catch (e) { answerText = ''; grounded = false; }\n// An ungrounded deflection has no business sitting on top of a booking\n// confirmation - that is how a lead was told there was nothing for them and\n// that they were booked in, in the same message.\nconst foldIn = grounded ? answerText : '';\n\nconst history = Array.isArray(cfg.history) ? cfg.history : [];\nconst isFirstTurn = history.filter(function (h) { return h && h.direction === 'outbound'; }).length === 0;\n\nconst filled = (cfg.filled_values && typeof cfg.filled_values === 'object') ? cfg.filled_values : {};\nconst namedContext = String(filled.project_interest || '');\nconst known = {};\nfor (const k of Object.keys(filled)) {\n  const v = filled[k];\n  if (k === 'budget' && v && typeof v === 'object') { known[k] = v.stated_text ? v.stated_text : 'already given'; }\n  else if (v && typeof v === 'object') { known[k] = JSON.stringify(v); }\n  else { known[k] = v; }\n}\n\nconst tz = cfg.lead_tz || 'Asia/Dubai';\nlet label = '';\ntry {\n  const dt = DateTime.fromISO(String(d.chosen_slot_utc || ''));\n  if (dt.isValid) label = dt.setZone(tz).toFormat('ccc d LLL, h:mm a');\n} catch (e) { label = ''; }\n\nconst fallback = (foldIn ? foldIn + nl + nl : '') + line('booked_line', 'Locked in for {slot}.').replace('{slot}', label || 'your chosen time');\n\nreturn [{ json: {\n  action: 'confirm_booking',\n  goal: String(d.goal || 'their meeting is now booked for the time given; confirm it and tell them the agent already has everything they have said'),\n  facts_json: JSON.stringify(label ? [label] : []),\n  known_json: JSON.stringify(known),\n  is_first_turn: isFirstTurn,\n  lead_named_context: namedContext,\n  answer_text: foldIn,\n  grounded: grounded,\n  choices_json: '[]',\n  variant: d.variant || '',\n  history_json: JSON.stringify(history),\n  language: lang,\n  lead_last_message: cfg.combined_text || '',\n  fallback_text: fallback,\n  slot_key: '',\n  asked_slot: false\n} }];"
+      }
+    },
+    {
+      "id": "431f894b-9ff4-4b93-9dad-653c147efe2c",
+      "name": "Assemble Slot Taken Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4180,
+        420
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const cfg = $('Gather Unprocessed Messages').first().json;\nconst d = $('Decide Next Step').first().json;\nconst lines = cfg.lines || {};\nconst lang = cfg.language || 'en';\nconst nl = String.fromCharCode(10);\nfunction line(key, fallback) { const l = lines[key] || {}; return l[lang] || l.en || fallback; }\n\nlet answerText = '';\nlet grounded = false;\ntry {\n  const a = $('Answer Question').first().json;\n  answerText = a.answer_text || '';\n  grounded = a.grounded === true;\n} catch (e) { answerText = ''; grounded = false; }\nconst foldIn = grounded ? answerText : '';\n\nconst history = Array.isArray(cfg.history) ? cfg.history : [];\nconst isFirstTurn = history.filter(function (h) { return h && h.direction === 'outbound'; }).length === 0;\n\nconst filled = (cfg.filled_values && typeof cfg.filled_values === 'object') ? cfg.filled_values : {};\nconst namedContext = String(filled.project_interest || '');\nconst known = {};\nfor (const k of Object.keys(filled)) {\n  const v = filled[k];\n  if (k === 'budget' && v && typeof v === 'object') { known[k] = v.stated_text ? v.stated_text : 'already given'; }\n  else if (v && typeof v === 'object') { known[k] = JSON.stringify(v); }\n  else { known[k] = v; }\n}\n\nconst fallback = (foldIn ? foldIn + nl + nl : '') + line('slot_taken_line', 'That time has just been taken. Which of the other times works for you?');\n\nreturn [{ json: {\n  action: 'slot_taken',\n  goal: 'the time they picked has just been taken; say so plainly and ask which of the other times already offered works instead',\n  facts_json: '[]',\n  known_json: JSON.stringify(known),\n  is_first_turn: isFirstTurn,\n  lead_named_context: namedContext,\n  answer_text: foldIn,\n  grounded: grounded,\n  choices_json: '[]',\n  variant: d.variant || '',\n  history_json: JSON.stringify(history),\n  language: lang,\n  lead_last_message: cfg.combined_text || '',\n  fallback_text: fallback,\n  slot_key: '',\n  asked_slot: false\n} }];"
+      }
+    },
+    {
+      "id": "cee38c84-9876-4355-a4dd-5a075e45c02f",
+      "name": "Assemble Already Booked Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3740,
+        560
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const cfg = $('Gather Unprocessed Messages').first().json;\nconst d = $('Decide Next Step').first().json;\nconst lines = cfg.lines || {};\nconst lang = cfg.language || 'en';\nconst nl = String.fromCharCode(10);\nfunction line(key, fallback) { const l = lines[key] || {}; return l[lang] || l.en || fallback; }\n\nlet answerText = '';\nlet grounded = false;\ntry {\n  const a = $('Answer Question').first().json;\n  answerText = a.answer_text || '';\n  grounded = a.grounded === true;\n} catch (e) { answerText = ''; grounded = false; }\nconst foldIn = grounded ? answerText : '';\n\nconst history = Array.isArray(cfg.history) ? cfg.history : [];\nconst isFirstTurn = history.filter(function (h) { return h && h.direction === 'outbound'; }).length === 0;\n\nconst filled = (cfg.filled_values && typeof cfg.filled_values === 'object') ? cfg.filled_values : {};\nconst namedContext = String(filled.project_interest || '');\nconst known = {};\nfor (const k of Object.keys(filled)) {\n  const v = filled[k];\n  if (k === 'budget' && v && typeof v === 'object') { known[k] = v.stated_text ? v.stated_text : 'already given'; }\n  else if (v && typeof v === 'object') { known[k] = JSON.stringify(v); }\n  else { known[k] = v; }\n}\n\nconst tz = cfg.lead_tz || 'Asia/Dubai';\nlet label = '';\ntry {\n  const dt = DateTime.fromISO(String(cfg.confirmed_starts_at || ''));\n  if (dt.isValid) label = dt.setZone(tz).toFormat('ccc d LLL, h:mm a');\n} catch (e) { label = ''; }\n\nconst fallback = (foldIn ? foldIn + nl + nl : '') + line('already_booked_line', 'You are already booked in for {slot}.').replace('{slot}', label || 'your meeting');\n\nreturn [{ json: {\n  action: 'already_booked',\n  goal: String(d.goal || 'they are already booked for the time given; remind them of it and let them know nothing else is needed from them'),\n  facts_json: JSON.stringify(label ? [label] : []),\n  known_json: JSON.stringify(known),\n  is_first_turn: isFirstTurn,\n  lead_named_context: namedContext,\n  answer_text: foldIn,\n  grounded: grounded,\n  choices_json: '[]',\n  variant: d.variant || '',\n  history_json: JSON.stringify(history),\n  language: lang,\n  lead_last_message: cfg.combined_text || '',\n  fallback_text: fallback,\n  slot_key: '',\n  asked_slot: false\n} }];"
+      }
+    },
+    {
+      "id": "ff1c8eae-871a-4ad9-bf7d-faf2848c0673",
+      "name": "Mark Nurture",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        3740,
+        720
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "with uc as (update lqs.conversations set status = 'nurture', updated_at = now() where id = $1::uuid returning id, lead_id, language, market_id), ul as (update lqs.leads set status = 'nurture', updated_at = now() where id = (select lead_id from uc) returning id) select coalesce(m.disclaimers->'nurture_line'->>coalesce((select language from uc), 'en'), m.disclaimers->'nurture_line'->>'en', 'Thanks for your time.') as nurture_line, (select id from ul) as lead_id from lqs.markets m where m.id = (select market_id from uc);",
+        "options": {
+          "queryReplacement": "={{ [$('Resolve Identity').item.json.conversation_id] }}"
+        }
+      }
+    },
+    {
+      "id": "3c03ed7b-9ad6-47fa-9166-29f86042655f",
+      "name": "Assemble Nurture Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3960,
+        720
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const cfg = $('Gather Unprocessed Messages').first().json;\nconst d = $('Decide Next Step').first().json;\nconst nl = String.fromCharCode(10);\n\nlet answerText = '';\nlet grounded = false;\ntry {\n  const a = $('Answer Question').first().json;\n  answerText = a.answer_text || '';\n  grounded = a.grounded === true;\n} catch (e) { answerText = ''; grounded = false; }\nconst foldIn = grounded ? answerText : '';\n\nconst history = Array.isArray(cfg.history) ? cfg.history : [];\nconst isFirstTurn = history.filter(function (h) { return h && h.direction === 'outbound'; }).length === 0;\n\nconst filled = (cfg.filled_values && typeof cfg.filled_values === 'object') ? cfg.filled_values : {};\nconst namedContext = String(filled.project_interest || '');\nconst known = {};\nfor (const k of Object.keys(filled)) {\n  const v = filled[k];\n  if (k === 'budget' && v && typeof v === 'object') { known[k] = v.stated_text ? v.stated_text : 'already given'; }\n  else if (v && typeof v === 'object') { known[k] = JSON.stringify(v); }\n  else { known[k] = v; }\n}\n\nconst nurtureLine = String($input.first().json.nurture_line || 'Thanks for your time.');\nconst fallback = (foldIn ? foldIn + nl + nl : '') + nurtureLine;\n\nreturn [{ json: {\n  action: 'nurture',\n  goal: String(d.goal || 'close the conversation warmly, with no meeting, and leave the door open for future launches'),\n  facts_json: '[]',\n  known_json: JSON.stringify(known),\n  is_first_turn: isFirstTurn,\n  lead_named_context: namedContext,\n  answer_text: foldIn,\n  grounded: grounded,\n  choices_json: '[]',\n  variant: d.variant || '',\n  history_json: JSON.stringify(history),\n  language: cfg.language || 'en',\n  lead_last_message: cfg.combined_text || '',\n  fallback_text: fallback,\n  slot_key: '',\n  asked_slot: false\n} }];"
+      }
+    },
+    {
+      "id": "9a862fb4-c14e-4037-8188-2538a9992ebf",
+      "name": "Escalate Cannot Decide",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        3740,
+        900
+      ],
+      "parameters": {
+        "mode": "each",
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "VjeV6TM8Yi6J729i",
+          "cachedResultName": "LQS - Escalation: hand to human"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": [],
+          "value": {
+            "conversation_id": "={{ $('Resolve Identity').item.json.conversation_id }}",
+            "reason": "={{ $json.error || 'cannot_decide' }}"
+          }
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "2a5d0d19-6ca2-48bf-9b36-804277b39008",
+      "name": "Clear Lock After Cannot Decide",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        3960,
+        900
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "with mark as (update lqs.messages set processed_at = now() where conversation_id = $1::uuid and direction = 'inbound' and processed_at is null returning id) update lqs.conversations set processing_until = null, updated_at = now() where id = $1::uuid returning (select count(*) from mark)::int as marked;",
+        "options": {
+          "queryReplacement": "={{ [$('Resolve Identity').item.json.conversation_id] }}"
+        }
+      }
+    },
+    {
+      "id": "fac39da1-3c45-4b2c-8275-72e9be8e18b4",
+      "name": "Return Cannot Decide",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        4180,
+        900
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ok",
+              "name": "ok",
+              "value": false,
+              "type": "boolean"
+            },
+            {
+              "id": "err",
+              "name": "error",
+              "value": "no_slot_definitions",
+              "type": "string"
+            },
+            {
+              "id": "act",
+              "name": "action",
+              "value": "escalated",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "e8da77a7-6093-43fd-b778-8e178de7b8c1",
+      "name": "Still Newest",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5060,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.gate }}",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              },
+              "rightValue": "ok"
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "0f426dec-78fb-48fb-a2d8-ef90f60efba7",
+      "name": "Send Reply",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        5280,
+        200
+      ],
+      "parameters": {
+        "mode": "each",
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "1uHZWNuI2G1IOzVs",
+          "cachedResultName": "LQS - Channel: send message"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": [],
+          "value": {
+            "conversation_id": "={{ $('Resolve Identity').item.json.conversation_id }}",
+            "text": "={{ $('Recheck Newest Message').item.json.reply_text }}"
+          }
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "c8740b51-ddf4-4448-b161-f2bb2899a8f1",
+      "name": "Finalise Turn",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        5500,
+        200
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "with mark as (update lqs.messages set processed_at = now() where conversation_id = $1::uuid and direction = 'inbound' and processed_at is null returning id), attempt as (insert into lqs.qualification (conversation_id, slot_key, state, attempts, updated_at) select $1::uuid, $2, case when 1 >= $4::int then 'unanswered' else 'empty' end, 1, now() where nullif($2, '') is not null on conflict (conversation_id, slot_key) do update set attempts = lqs.qualification.attempts + 1, state = case when lqs.qualification.attempts + 1 >= $4::int and lqs.qualification.state in ('empty', 'unanswered') then 'unanswered' else lqs.qualification.state end, updated_at = now() returning slot_key), conv as (update lqs.conversations set questions_asked = questions_asked + case when $3::boolean then 1 else 0 end, processing_until = null, updated_at = now() where id = $1::uuid returning id, questions_asked) select (select count(*) from mark)::int as marked, (select questions_asked from conv) as questions_asked;",
+        "options": {
+          "queryReplacement": "={{ [$('Resolve Identity').item.json.conversation_id, $('Recheck Newest Message').item.json.asked_slot ? $('Recheck Newest Message').item.json.slot_key : '', $('Recheck Newest Message').item.json.asked_slot === true, $('Persist Message').item.json.slot_max_attempts] }}"
+        }
+      }
+    },
+    {
+      "id": "2fd694dd-11e5-4b08-a9ad-353f53dd7a16",
+      "name": "Return",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        5720,
+        200
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ok",
+              "name": "ok",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "act",
+              "name": "action",
+              "value": "={{ $('Recheck Newest Message').item.json.action }}",
+              "type": "string"
+            },
+            {
+              "id": "q",
+              "name": "questions_asked",
+              "value": "={{ $json.questions_asked }}",
+              "type": "number"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "3fa19acc-fde3-459e-adcc-cfa147528639",
+      "name": "Unlock And Defer",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        5280,
+        460
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "update lqs.conversations set processing_until = null, updated_at = now() where id = $1::uuid returning id;",
+        "options": {
+          "queryReplacement": "={{ [$('Resolve Identity').item.json.conversation_id] }}"
+        }
+      }
+    },
+    {
+      "id": "76116106-b04b-4458-b4cc-4fae6a658a06",
+      "name": "Return Superseded Late",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        5500,
+        460
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ok",
+              "name": "ok",
+              "value": false,
+              "type": "boolean"
+            },
+            {
+              "id": "err",
+              "name": "error",
+              "value": "superseded",
+              "type": "string"
+            },
+            {
+              "id": "act",
+              "name": "action",
+              "value": "none",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "073701f3-bc3f-4e97-9980-b50fe5f8b960",
+      "name": "Load Existing Offer",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        3960,
+        -300
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "select bk.offered_slots as slots, bk.id as booking_id from lqs.bookings bk where bk.conversation_id = $1::uuid and bk.status = 'offered' order by bk.created_at desc limit 1;",
+        "options": {
+          "queryReplacement": "={{ [$('Resolve Identity').item.json.conversation_id] }}"
+        }
+      }
+    },
+    {
+      "id": "52f19b3b-42f6-4b5c-bb6b-4c279728e57f",
+      "name": "Mark Booking Declined",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        3740,
+        1080
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "with upd as (update lqs.bookings set status = 'declined' where conversation_id = $1::uuid and status = 'offered' returning id), conv as (update lqs.conversations set booking_declines = booking_declines + 1, updated_at = now() where id = $1::uuid returning booking_declines) select (select count(*) from upd)::int as offers_closed, (select booking_declines from conv) as declines;",
+        "options": {
+          "queryReplacement": "={{ [$('Resolve Identity').item.json.conversation_id] }}"
+        }
+      }
+    },
+    {
+      "id": "d1e86b3e-a32f-4bf3-ac25-71b2578cd922",
+      "name": "Assemble Decline Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3960,
+        1080
+      ],
+      "parameters": {
+        "jsCode": "const cfg = $('Gather Unprocessed Messages').first().json;\nconst d = $('Decide Next Step').first().json;\nconst lines = cfg.lines || {};\nconst lang = cfg.language || 'en';\nconst nl = String.fromCharCode(10);\nfunction line(key, fallback) { const l = lines[key] || {}; return l[lang] || l.en || fallback; }\n\nlet answerText = '';\nlet grounded = false;\ntry {\n  const a = $('Answer Question').first().json;\n  answerText = a.answer_text || '';\n  grounded = a.grounded === true;\n} catch (e) { answerText = ''; grounded = false; }\n// A lead who says \"not yet, tell me about prices first\" asked a question in the\n// same breath as the refusal. Answering it is the whole point of accepting the\n// refusal gracefully, so a grounded answer is folded in.\nconst foldIn = grounded ? answerText : '';\n\nconst history = Array.isArray(cfg.history) ? cfg.history : [];\nconst isFirstTurn = history.filter(function (h) { return h && h.direction === 'outbound'; }).length === 0;\n\nconst filled = (cfg.filled_values && typeof cfg.filled_values === 'object') ? cfg.filled_values : {};\nconst namedContext = String(filled.project_interest || '');\nconst known = {};\nfor (const k of Object.keys(filled)) {\n  const v = filled[k];\n  if (k === 'budget' && v && typeof v === 'object') { known[k] = v.stated_text ? v.stated_text : 'already given'; }\n  else if (v && typeof v === 'object') { known[k] = JSON.stringify(v); }\n  else { known[k] = v; }\n}\n\nconst ack = String(d.question_text || '').trim() || line('decline_ack_line', 'No problem, no meeting for now. Ask me anything you like about the projects.');\nconst fallback = (foldIn ? foldIn + nl + nl : '') + ack;\n\nreturn [{ json: {\n  action: 'acknowledge_decline',\n  goal: String(d.goal || 'they do not want a meeting right now; accept that without pushing back, and invite them to ask anything they want about the projects'),\n  facts_json: '[]',\n  known_json: JSON.stringify(known),\n  is_first_turn: isFirstTurn,\n  lead_named_context: namedContext,\n  answer_text: foldIn,\n  grounded: grounded,\n  choices_json: '[]',\n  variant: d.variant || '',\n  history_json: JSON.stringify(history),\n  language: lang,\n  lead_last_message: cfg.combined_text || '',\n  fallback_text: fallback,\n  slot_key: '',\n  asked_slot: false\n} }];"
+      }
+    },
+    {
+      "id": "4741cd80-11b5-4e83-8ec7-4fc76f8cc309",
+      "name": "Compose Reply",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        4600,
+        300
+      ],
+      "parameters": {
+        "mode": "each",
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "RIXG7dG23n7vH6Y1",
+          "cachedResultName": "LQS - Subworkflow: compose reply"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": [],
+          "value": {
+            "action": "={{ $json.action }}",
+            "goal": "={{ $json.goal }}",
+            "facts_json": "={{ $json.facts_json }}",
+            "known_json": "={{ $json.known_json }}",
+            "is_first_turn": "={{ $json.is_first_turn }}",
+            "lead_named_context": "={{ $json.lead_named_context }}",
+            "answer_text": "={{ $json.answer_text }}",
+            "grounded": "={{ $json.grounded }}",
+            "choices_json": "={{ $json.choices_json }}",
+            "variant": "={{ $json.variant }}",
+            "history_json": "={{ $json.history_json }}",
+            "language": "={{ $json.language }}",
+            "lead_last_message": "={{ $json.lead_last_message }}",
+            "fallback_text": "={{ $json.fallback_text }}",
+            "slot_key": "={{ $json.slot_key }}",
+            "asked_slot": "={{ $json.asked_slot }}"
+          }
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Workflow Input": {
+      "main": [
+        [
+          {
+            "node": "Resolve Identity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Identity": {
+      "main": [
+        [
+          {
+            "node": "Persist Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persist Message": {
+      "main": [
+        [
+          {
+            "node": "Is Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Duplicate": {
+      "main": [
+        [
+          {
+            "node": "Return Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Debounce",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Debounce": {
+      "main": [
+        [
+          {
+            "node": "Check Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Gate": {
+      "main": [
+        [
+          {
+            "node": "Route Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Gate": {
+      "main": [
+        [
+          {
+            "node": "Return Superseded",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Return Locked",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Return Logged Only",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Gather Unprocessed Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gather Unprocessed Messages": {
+      "main": [
+        [
+          {
+            "node": "Extract Facts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Facts": {
+      "main": [
+        [
+          {
+            "node": "Save Answers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Answers": {
+      "main": [
+        [
+          {
+            "node": "Update Streaks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Streaks": {
+      "main": [
+        [
+          {
+            "node": "Escalation Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Escalation Check": {
+      "main": [
+        [
+          {
+            "node": "Should Escalate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should Escalate": {
+      "main": [
+        [
+          {
+            "node": "Escalate To Human",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Is Question",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Escalate To Human": {
+      "main": [
+        [
+          {
+            "node": "Clear Lock After Escalation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clear Lock After Escalation": {
+      "main": [
+        [
+          {
+            "node": "Return Escalated",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Question": {
+      "main": [
+        [
+          {
+            "node": "Answer Question",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Decide Next Step",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Answer Question": {
+      "main": [
+        [
+          {
+            "node": "Decide Next Step",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide Next Step": {
+      "main": [
+        [
+          {
+            "node": "Route Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Action": {
+      "main": [
+        [
+          {
+            "node": "Assemble Ask Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Offer Slots",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Confirm Booking",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Assemble Already Booked Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Nurture",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Load Existing Offer",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Booking Declined",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Escalate Cannot Decide",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Recheck Newest Message": {
+      "main": [
+        [
+          {
+            "node": "Still Newest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Offer Slots": {
+      "main": [
+        [
+          {
+            "node": "Slots Found",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slots Found": {
+      "main": [
+        [
+          {
+            "node": "Assemble Offer Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Escalate No Slots",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Escalate No Slots": {
+      "main": [
+        [
+          {
+            "node": "Clear Lock After No Slots",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clear Lock After No Slots": {
+      "main": [
+        [
+          {
+            "node": "Return Handover No Slots",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confirm Booking": {
+      "main": [
+        [
+          {
+            "node": "Booking Confirmed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Booking Confirmed": {
+      "main": [
+        [
+          {
+            "node": "Generate Brief",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Assemble Slot Taken Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Brief": {
+      "main": [
+        [
+          {
+            "node": "Assemble Booked Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Nurture": {
+      "main": [
+        [
+          {
+            "node": "Assemble Nurture Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Escalate Cannot Decide": {
+      "main": [
+        [
+          {
+            "node": "Clear Lock After Cannot Decide",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clear Lock After Cannot Decide": {
+      "main": [
+        [
+          {
+            "node": "Return Cannot Decide",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Still Newest": {
+      "main": [
+        [
+          {
+            "node": "Send Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Unlock And Defer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Reply": {
+      "main": [
+        [
+          {
+            "node": "Finalise Turn",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Finalise Turn": {
+      "main": [
+        [
+          {
+            "node": "Return",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unlock And Defer": {
+      "main": [
+        [
+          {
+            "node": "Return Superseded Late",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Existing Offer": {
+      "main": [
+        [
+          {
+            "node": "Assemble Offer Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Booking Declined": {
+      "main": [
+        [
+          {
+            "node": "Assemble Decline Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble Ask Reply": {
+      "main": [
+        [
+          {
+            "node": "Compose Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble Offer Reply": {
+      "main": [
+        [
+          {
+            "node": "Compose Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble Booked Reply": {
+      "main": [
+        [
+          {
+            "node": "Compose Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble Slot Taken Reply": {
+      "main": [
+        [
+          {
+            "node": "Compose Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble Already Booked Reply": {
+      "main": [
+        [
+          {
+            "node": "Compose Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble Nurture Reply": {
+      "main": [
+        [
+          {
+            "node": "Compose Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble Decline Reply": {
+      "main": [
+        [
+          {
+            "node": "Compose Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compose Reply": {
+      "main": [
+        [
+          {
+            "node": "Recheck Newest Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "activeVersionId": "e7569cdc-d264-4f45-bd6b-c7985582819b",
+  "versionId": "e7569cdc-d264-4f45-bd6b-c7985582819b"
+}

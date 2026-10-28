@@ -1,0 +1,185 @@
+{
+  "name": "LQS - Qualification: decide next step",
+  "id": "hpe6dyktPusHzO8O",
+  "active": true,
+  "versionId": "e5b99a8c-8d3f-4c16-af5e-5269770bee20",
+  "description": "Reads only. In: conversation_id, intent. Out: { ok, action, slot_key, variant, question_text, choices_json, chosen_slot_utc }. Pure code implementation of the supervisor ladder decision rules. No AI node. Returns no_slot_definitions when the market has no slots.",
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": true,
+    "errorWorkflow": "f2C3GiauR1vJiIxw"
+  },
+  "nodes": [
+    {
+      "id": "7342941a-b763-47a5-b43f-f1b0128e60ae",
+      "name": "Workflow Input",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "conversation_id",
+              "type": "string"
+            },
+            {
+              "name": "intent",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "463f6cbd-d3bd-426b-ad1d-2f3c04b62a78",
+      "name": "Load Decision Context",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        240,
+        0
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "select c.id as conversation_id, c.status as conversation_status, c.deal_type as deal_type, c.questions_asked as questions_asked, c.language as language, c.booking_declines as declines, l.full_name as lead_full_name, m.thresholds as thresholds, m.currency as currency, m.disclaimers as lines, (select coalesce(json_agg(sd2), '[]'::json) from (select sd.slot_key, sd.tier, sd.priority, sd.required, sd.value_type, sd.question_open, sd.question_goal, sd.question_choices, sd.condition, sd.extraction_hint from lqs.slot_definitions sd where sd.market_id = c.market_id and sd.deal_type = c.deal_type and sd.active order by sd.priority) sd2) as slot_definitions, (select coalesce(json_agg(json_build_object('slot_key', q.slot_key, 'value', q.value, 'state', q.state, 'attempts', q.attempts, 'previous_values', q.previous_values)), '[]'::json) from lqs.qualification q where q.conversation_id = c.id) as qualification, (select row_to_json(b) from (select bk.id, bk.status, bk.offered_slots from lqs.bookings bk where bk.conversation_id = c.id order by bk.created_at desc limit 1) b) as latest_booking, (select count(*) from lqs.bookings bk where bk.conversation_id = c.id)::int as offers_made, (select count(*) from lqs.messages mm where mm.conversation_id = c.id and mm.direction = 'outbound' and mm.created_at > coalesce((select bk2.created_at from lqs.bookings bk2 where bk2.conversation_id = c.id and bk2.status = 'offered' order by bk2.created_at desc limit 1), now()))::int as outbound_since_offer, (select mm.body from lqs.messages mm where mm.conversation_id = c.id and mm.direction = 'inbound' order by mm.created_at desc limit 1) as last_inbound_text from lqs.conversations c join lqs.leads l on l.id = c.lead_id join lqs.markets m on m.id = c.market_id where c.id = $1::uuid;",
+        "options": {
+          "queryReplacement": "={{ [$json.conversation_id] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "CREDENTIAL_ID",
+          "name": "postgres (set your own)"
+        }
+      }
+    },
+    {
+      "id": "3131e3e3-bdd8-4427-a03d-7f08136a24c9",
+      "name": "Decide Next Step",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const ctx = $input.first().json;\nconst intent = ($('Workflow Input').first().json.intent) || 'answering';\n\nfunction out(o) {\n  return [{ json: Object.assign({ ok: true, action: '', slot_key: '', variant: '', question_text: '', goal: '', choices_json: '[]', chosen_slot_utc: '' }, o) }];\n}\n\nconst defs = Array.isArray(ctx.slot_definitions) ? ctx.slot_definitions : [];\nif (defs.length === 0) {\n  return [{ json: { ok: false, error: 'no_slot_definitions', action: '', slot_key: '', variant: '', question_text: '', goal: '', choices_json: '[]', chosen_slot_utc: '' } }];\n}\n\nconst th = ctx.thresholds || {};\nconst maxAttempts = typeof th.slot_max_attempts === 'number' ? th.slot_max_attempts : 2;\nconst maxQuestions = typeof th.max_questions === 'number' ? th.max_questions : 8;\n// How many times the bot may put a list of times in front of one lead. A third\n// identical slot list is how it used to tell a lead it was stuck.\nconst maxOffers = typeof th.max_booking_offers === 'number' ? th.max_booking_offers : 2;\nconst nurtureMaxBudget = typeof th.nurture_max_budget === 'number' ? th.nurture_max_budget : 0;\nconst nurturePurposes = Array.isArray(th.nurture_purposes) ? th.nurture_purposes : [];\n\nconst lines = ctx.lines || {};\nconst leadName = String(ctx.lead_full_name || '').trim();\nfunction line(key) {\n  const l = lines[key];\n  if (!l || typeof l !== 'object') return '';\n  return String(l[ctx.language] || l.en || '').trim();\n}\n\nconst qual = {};\nfor (const q of (Array.isArray(ctx.qualification) ? ctx.qualification : [])) { qual[q.slot_key] = q; }\nconst stateOf = function (k) { return qual[k] ? qual[k].state : 'empty'; };\nconst valueOf = function (k) { return qual[k] ? qual[k].value : null; };\nconst attemptsOf = function (k) { return qual[k] ? (qual[k].attempts || 0) : 0; };\n\nconst offersMade = Number(ctx.offers_made || 0);\nconst declines = Number(ctx.declines || 0);\nconst outboundSinceOffer = Number(ctx.outbound_since_offer || 0);\n\nfunction comparable(v) {\n  if (v && typeof v === 'object' && !Array.isArray(v) && (typeof v.min === 'number' || typeof v.max === 'number')) {\n    return typeof v.min === 'number' ? v.min : 0;\n  }\n  return v;\n}\n\nfunction conditionSatisfied(cond) {\n  if (!cond) return true;\n  const st = stateOf(cond.slot);\n  const known = (st === 'filled' || st === 'conflicted');\n  // empty/filled ask about presence, so they must be answered before the\n  // value comparisons below bail out on an unfilled slot.\n  if (cond.op === 'empty') return !known;\n  if (cond.op === 'filled') return known;\n  if (!known) return false;\n  const v = comparable(valueOf(cond.slot));\n  const target = cond.value;\n  if (cond.op === 'eq') return String(v) === String(target);\n  if (cond.op === 'neq') return String(v) !== String(target);\n  if (cond.op === 'gte') return Number(v) >= Number(target);\n  if (cond.op === 'lte') return Number(v) <= Number(target);\n  if (cond.op === 'in') return Array.isArray(target) && target.map(String).indexOf(String(v)) !== -1;\n  return false;\n}\n\nconst applicable = defs.filter(function (d) { return conditionSatisfied(d.condition); });\napplicable.sort(function (a, b) { return a.priority - b.priority; });\n\nfunction fmtMoney(n, cur) {\n  const c = cur || ctx.currency || 'AED';\n  if (n >= 1000000) return (Math.round((n / 1000000) * 10) / 10) + 'M ' + c;\n  if (n >= 1000) return (Math.round(n / 1000)) + 'K ' + c;\n  return n + ' ' + c;\n}\n\nfunction renderValue(v) {\n  if (v === null || v === undefined) return '';\n  if (typeof v === 'object' && !Array.isArray(v)) {\n    if (typeof v.min === 'number' || typeof v.max === 'number') {\n      if (typeof v.stated_text === 'string' && v.stated_text) return v.stated_text;\n      if (typeof v.min === 'number' && typeof v.max === 'number') return fmtMoney(v.min, v.currency) + ' to ' + fmtMoney(v.max, v.currency);\n      if (typeof v.max === 'number') return 'up to ' + fmtMoney(v.max, v.currency);\n      return 'from ' + fmtMoney(v.min, v.currency);\n    }\n    const bits = [];\n    if (v.full_name) bits.push(v.full_name);\n    if (v.phone) bits.push(v.phone);\n    if (v.email) bits.push(v.email);\n    if (bits.length) return bits.join(', ');\n    return JSON.stringify(v);\n  }\n  return String(v);\n}\n\nfunction askSlot(def) {\n  const attempts = attemptsOf(def.slot_key);\n  const choices = Array.isArray(def.question_choices) ? def.question_choices : [];\n  const useChoices = attempts >= 1 && choices.length > 0;\n  const variant = useChoices ? 'choices' : 'open';\n  // question_open is now only the fallback wording, used when the composer\n  // fails. question_goal is what the composer actually works from, so it can\n  // write a sentence that fits the conversation instead of reciting a seed\n  // string written for a lead who arrived talking about a project.\n  let text = def.question_open;\n  let goal = String(def.question_goal || def.question_open || '');\n  if (def.slot_key === 'contact' && leadName) {\n    const alt = line('contact_phone_only_line');\n    if (alt) text = alt;\n    goal = goal + ' - they have already given their name as ' + leadName + ', so never ask for it';\n  }\n  return out({ action: 'ask_slot', slot_key: def.slot_key, variant: variant, question_text: text, goal: goal, choices_json: JSON.stringify(useChoices ? choices : []) });\n}\n\nfunction declineOut(variant, goal, fallback) {\n  return out({ action: 'acknowledge_decline', variant: variant, goal: goal, question_text: fallback || line('decline_ack_line') });\n}\n\n// One place decides whether the bot may put times in front of the lead again.\n// Before this, every path that ran out of questions offered a meeting, so a\n// lead who had just said no was offered one again on the very next turn.\nfunction offerBooking(variant) {\n  if (intent === 'booking_intent') {\n    return out({ action: 'offer_booking', variant: variant, goal: 'they have asked about meeting the agent; offer the times listed and ask which one suits them' });\n  }\n  if (declines >= 1 || offersMade >= maxOffers) {\n    return declineOut('holding', 'they have already turned a meeting down, so never raise one again; just make clear you are here for any questions about the projects', line('declined_twice_line'));\n  }\n  return out({ action: 'offer_booking', variant: variant, goal: 'offer the times listed and ask which one suits them' });\n}\n\n// Character classes rather than escapes: this source is round-tripped through\n// JSON on every edit and a backslash does not always survive it.\nconst LABEL_RE = /^([a-z]{3})[ ]+([0-9]{1,2})[ ]+([a-z]{3}),?[ ]*([0-9]{1,2}):([0-9]{2})[ ]*(am|pm)/;\n\nfunction normalise(rawText) {\n  return ' ' + String(rawText || '')\n    .toLowerCase()\n    .replace(/['’]/g, '')\n    // \"31st\" has to become \"31\" before the split, or the day number never matches.\n    .replace(/([0-9])(st|nd|rd|th)(?![a-z])/g, '$1')\n    .replace(/[^a-z0-9:]+/g, ' ') + ' ';\n}\n\n// A lead who is saying no is not picking a slot, whatever else is in the\n// sentence. \"I dont want a meeting yet first give me information\" booked a\n// meeting because \"first\" scored as slot number one.\nconst REFUSALS = ['no', 'not', 'nope', 'nah', 'dont', 'doesnt', 'didnt', 'cant', 'cannot', 'wont', 'wouldnt', 'never', 'later', 'skip', 'busy', 'unavailable'];\n\nfunction looksLikeRefusal(text) {\n  for (let i = 0; i < REFUSALS.length; i++) {\n    if (text.indexOf(' ' + REFUSALS[i] + ' ') !== -1) return true;\n  }\n  return false;\n}\n\nfunction matchOfferedSlot(offered, rawText) {\n  const text = normalise(rawText);\n  if (looksLikeRefusal(text)) return null;\n\n  const has = function (w) { return !!w && text.indexOf(' ' + w + ' ') !== -1; };\n  const wordCount = text.trim().split(' ').filter(Boolean).length;\n  const shortMessage = wordCount <= 5;\n\n  const dayFull = { mon: 'monday', tue: 'tuesday', wed: 'wednesday', thu: 'thursday', fri: 'friday', sat: 'saturday', sun: 'sunday' };\n  const ordinalDigit = [['1'], ['2'], ['3']];\n  const ordinalWord = [['first', 'one'], ['second', 'two'], ['third', 'three']];\n\n  let best = null;\n  let bestScore = 0;\n  let tied = false;\n\n  for (let i = 0; i < offered.length; i++) {\n    const label = String(offered[i].label_local || '').toLowerCase();\n    let score = 0;\n\n    if (i < 3) {\n      let digit = false;\n      for (const t of ordinalDigit[i]) { if (has(t)) { digit = true; break; } }\n      let word = false;\n      for (const t of ordinalWord[i]) { if (has(t)) { word = true; break; } }\n      // A digit outranks a day number so a bare \"1\" still picks slot one even\n      // when another slot falls on the 1st. A bare ordinal WORD only counts as\n      // a pick in a short, choice-like message; inside a sentence it is prose.\n      if (digit) score += 4;\n      else if (word) score += (shortMessage ? 3 : 1);\n    }\n\n    const m = label.match(LABEL_RE);\n    if (m) {\n      const wdShort = m[1];\n      const dayNum = m[2];\n      const monShort = m[3];\n      const hour = m[4];\n      const mins = m[5];\n      const mer = m[6];\n      if (has(wdShort) || has(dayFull[wdShort])) score += 3;\n      if (has(dayNum)) score += 3;\n      if (has(monShort)) score += 1;\n      if (has(hour + mer) || has(hour + ':' + mins) || has(hour)) score += 1;\n    }\n\n    if (score > bestScore) { bestScore = score; best = offered[i]; tied = false; }\n    else if (score > 0 && score === bestScore) { tied = true; }\n  }\n\n  // Threshold raised from 2 to 3: one weak signal on its own must never book.\n  if (best && bestScore >= 3 && !tied) return best;\n  return null;\n}\n\nconst booking = ctx.latest_booking || null;\nconst awaitingChoice = !!(booking && booking.status === 'offered');\n\nif (ctx.conversation_status === 'booked') {\n  // A booked lead saying no is asking to cancel, which the bot may not do. The\n  // unknown action falls through Route Action to cannot_decide and a human\n  // picks it up.\n  if (intent === 'decline_booking') {\n    return out({ action: 'cancel_request', variant: 'booked_then_declined' });\n  }\n  return out({ action: 'confirm_booking', variant: 'already_booked', goal: 'they are already booked for the time given; remind them of it and let them know nothing else is needed from them' });\n}\n\n// A refusal is answered before anything else. Nothing in the ladder could hear\n// \"no\": the message fell through to reoffer_booking and the same three times\n// went out again, with nothing to stop it.\nif (intent === 'decline_booking') {\n  if (declines >= 1) {\n    return declineOut('declined_again', 'they have turned a meeting down more than once; accept it for good, never raise a meeting again, and make clear you are still here for questions about the projects', line('declined_twice_line'));\n  }\n  return declineOut('first_decline', 'they do not want a meeting right now; accept that without pushing back, and invite them to ask anything they want about the projects', line('decline_ack_line'));\n}\n\nconst conflicted = applicable.filter(function (d) { return stateOf(d.slot_key) === 'conflicted'; });\nif (conflicted.length > 0) {\n  const d = conflicted[0];\n  const q = qual[d.slot_key];\n  const prev = Array.isArray(q.previous_values) ? q.previous_values : [];\n  const oldV = prev.length ? prev[prev.length - 1] : null;\n  const choices = [\n    { label: renderValue(oldV), value: oldV },\n    { label: renderValue(q.value), value: q.value }\n  ];\n  return out({\n    action: 'resolve_conflict',\n    slot_key: d.slot_key,\n    variant: 'conflict',\n    question_text: 'I have two different answers for this. Which one should I go with?',\n    goal: 'you have two different answers on file for ' + d.slot_key + '; say so plainly and ask which of the two is right',\n    choices_json: JSON.stringify(choices)\n  });\n}\n\nif (awaitingChoice) {\n  const offered = Array.isArray(booking.offered_slots) ? booking.offered_slots : [];\n  const chosen = matchOfferedSlot(offered, ctx.last_inbound_text);\n  if (chosen) {\n    return out({ action: 'confirm_booking', variant: 'lead_picked', chosen_slot_utc: String(chosen.starts_at_utc || ''), goal: 'their meeting is now booked for the time given; confirm it and tell them the agent already has everything they have said' });\n  }\n}\n\nif (intent === 'booking_intent' && !awaitingChoice) {\n  return offerBooking('lead_asked');\n}\n\nif (!awaitingChoice) {\n  const tier1 = applicable.filter(function (d) { return d.tier === 1 && d.required === true; });\n  const tier1Pending = tier1.filter(function (d) {\n    const st = stateOf(d.slot_key);\n    return (st === 'empty' || st === 'unanswered') && attemptsOf(d.slot_key) < maxAttempts;\n  });\n  if (tier1Pending.length > 0) {\n    return askSlot(tier1Pending[0]);\n  }\n\n  const budget = valueOf('budget');\n  const timeline = valueOf('timeline');\n  const purpose = valueOf('purpose');\n  const budgetMax = (budget && typeof budget === 'object' && typeof budget.max === 'number') ? budget.max : null;\n  const failsNurture = (budgetMax !== null && budgetMax < nurtureMaxBudget) || (String(timeline) === 'exploring') || (purpose !== null && nurturePurposes.indexOf(String(purpose)) !== -1);\n  if (failsNurture) {\n    return out({ action: 'nurture', variant: 'below_bar', goal: 'close the conversation warmly, with no meeting, and leave the door open for future launches' });\n  }\n\n  if ((ctx.questions_asked || 0) < maxQuestions) {\n    const deeper = applicable.filter(function (d) {\n      return d.tier > 1 && stateOf(d.slot_key) === 'empty' && attemptsOf(d.slot_key) < maxAttempts;\n    });\n    if (deeper.length > 0) {\n      return askSlot(deeper[0]);\n    }\n  }\n}\n\nif (awaitingChoice) {\n  // Two slot lists is the limit. Past that the bot stops asking and stays\n  // useful instead - the old code returned reoffer_booking here forever.\n  if (outboundSinceOffer >= maxOffers) {\n    return declineOut('offers_exhausted', 'they have been shown the times and have not picked one; stop asking about a meeting and make clear you are happy to answer questions about the projects instead', line('decline_ack_line'));\n  }\n  return out({ action: 'reoffer_booking', variant: 'awaiting_choice', goal: 'they have not picked a time yet; put the same times back in front of them, worded differently from last time' });\n}\n\nreturn offerBooking('qualified');"
+      }
+    },
+    {
+      "id": "007c7a61-be34-49b6-b1ef-a64c35b1b1ae",
+      "name": "Return",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        720,
+        0
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ok",
+              "name": "ok",
+              "value": "={{ $json.ok }}",
+              "type": "boolean"
+            },
+            {
+              "id": "err",
+              "name": "error",
+              "value": "={{ $json.error || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "act",
+              "name": "action",
+              "value": "={{ $json.action }}",
+              "type": "string"
+            },
+            {
+              "id": "slot",
+              "name": "slot_key",
+              "value": "={{ $json.slot_key }}",
+              "type": "string"
+            },
+            {
+              "id": "var",
+              "name": "variant",
+              "value": "={{ $json.variant }}",
+              "type": "string"
+            },
+            {
+              "id": "qt",
+              "name": "question_text",
+              "value": "={{ $json.question_text }}",
+              "type": "string"
+            },
+            {
+              "id": "goal",
+              "name": "goal",
+              "value": "={{ $json.goal }}",
+              "type": "string"
+            },
+            {
+              "id": "ch",
+              "name": "choices_json",
+              "value": "={{ $json.choices_json }}",
+              "type": "string"
+            },
+            {
+              "id": "slotutc",
+              "name": "chosen_slot_utc",
+              "value": "={{ $json.chosen_slot_utc }}",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Workflow Input": {
+      "main": [
+        [
+          {
+            "node": "Load Decision Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Decision Context": {
+      "main": [
+        [
+          {
+            "node": "Decide Next Step",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide Next Step": {
+      "main": [
+        [
+          {
+            "node": "Return",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

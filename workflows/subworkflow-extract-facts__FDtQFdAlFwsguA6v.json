@@ -1,0 +1,324 @@
+{
+  "name": "LQS - Subworkflow: extract facts",
+  "id": "FDtQFdAlFwsguA6v",
+  "active": true,
+  "versionId": "3f823add-5d1b-4cfa-bd15-683de0dffd97",
+  "description": "Stateless. In: text, history_json, applicable_slots_json, filled_values_json, language_hint. Out: { ok, slots, intent, question_text, is_repeat_of_previous, language, unparseable } or { ok:false, error:'extraction_failed' }. The LLM extracts, code validates.",
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": true,
+    "errorWorkflow": "f2C3GiauR1vJiIxw"
+  },
+  "nodes": [
+    {
+      "name": "Workflow Input",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "text",
+              "type": "string"
+            },
+            {
+              "name": "history_json",
+              "type": "string"
+            },
+            {
+              "name": "applicable_slots_json",
+              "type": "string"
+            },
+            {
+              "name": "filled_values_json",
+              "type": "string"
+            },
+            {
+              "name": "language_hint",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Extraction Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.1,
+      "position": [
+        240,
+        200
+      ],
+      "parameters": {
+        "modelName": "models/gemini-3.1-flash-lite",
+        "options": {
+          "temperature": 0
+        }
+      },
+      "credentials": {
+        "googlePalmApi": {
+          "id": "CREDENTIAL_ID",
+          "name": "googlePalmApi (set your own)"
+        }
+      }
+    },
+    {
+      "name": "Retry Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.1,
+      "position": [
+        460,
+        320
+      ],
+      "parameters": {
+        "modelName": "models/gemini-3.1-flash-lite",
+        "options": {
+          "temperature": 0
+        }
+      },
+      "credentials": {
+        "googlePalmApi": {
+          "id": "CREDENTIAL_ID",
+          "name": "googlePalmApi (set your own)"
+        }
+      }
+    },
+    {
+      "name": "Fact Schema",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        400,
+        200
+      ],
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\"type\":\"object\",\"properties\":{\"slots\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"slot_key\":{\"type\":\"string\"},\"value_json\":{\"type\":\"string\"},\"confidence\":{\"type\":\"number\"}},\"required\":[\"slot_key\",\"value_json\",\"confidence\"]}},\"intent\":{\"type\":\"string\",\"enum\":[\"answering\",\"question\",\"request_human\",\"booking_intent\",\"decline_booking\",\"chitchat\",\"unclear\"]},\"question_text\":{\"type\":\"string\"},\"is_repeat_of_previous\":{\"type\":\"boolean\"},\"language\":{\"type\":\"string\"},\"unparseable\":{\"type\":\"boolean\"}},\"required\":[\"slots\",\"intent\",\"question_text\",\"is_repeat_of_previous\",\"language\",\"unparseable\"]}",
+        "autoFix": true
+      }
+    },
+    {
+      "name": "Extract Facts",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        240,
+        0
+      ],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "promptType": "define",
+        "hasOutputParser": true,
+        "text": "=MESSAGE FROM LEAD:\n{{ $json.text }}\n\nRECENT CONVERSATION HISTORY (oldest first):\n{{ $json.history_json }}\n\nAPPLICABLE SLOTS (only these slot_key values are allowed):\n{{ $json.applicable_slots_json }}\n\nVALUES ALREADY ON FILE:\n{{ $json.filled_values_json }}\n\nLIKELY LANGUAGE OF THE CONVERSATION: {{ $json.language_hint }}",
+        "messages": {
+          "messageValues": [
+            {
+              "type": "SystemMessagePromptTemplate",
+              "message": "You are the extraction listener for a real-estate qualification bot.\n\nYou extract structured facts only. You never reply to the lead, never ask a question, never decide anything, never book anything. Return valid JSON matching the schema and nothing else.\n\nRules:\n1. Only use slot_key values that appear in APPLICABLE SLOTS. Never invent a slot_key. Anything you are unsure about, leave out.\n2. Only include a slot when the message states it or clearly implies it. Never guess to be helpful.\n3. value_json must be a JSON-encoded string of the value: a quoted string for enum/text/date slots (for example \"investment\"), a JSON object for currency_range ({\"min\":2700000,\"max\":3300000,\"currency\":\"AED\",\"stated_text\":\"around 3 million\"}) and for contact ({\"full_name\":\"Sara\",\"phone\":\"+971501234567\",\"email\":null}), a bare number for number slots.\n4. For enum slots, value_json must be one of the choice values listed for that slot, never the label.\n5. confidence is 0 to 1. Use below 0.6 when you are inferring rather than reading.\n6. intent is exactly one of: answering, question, request_human, booking_intent, decline_booking, chitchat, unclear.\n   - booking_intent: they are asking to meet, to book, or to speak to the agent.\n   - decline_booking: they are turning a meeting down, putting it off, or saying they want something else first. \"no\", \"no meeting\", \"not now\", \"maybe later\", \"I dont want a meeting yet, first tell me about prices\" are all decline_booking. It stays decline_booking even when the same message also asks a question or answers one - a refusal outranks everything except a request for a human.\n   - question: it asks something factual about a property, price, plan or area, and is not a refusal.\n   A message can both answer a question and ask one.\n7. question_text is the lead question verbatim when the message asks one, otherwise an empty string. Fill it even when intent is decline_booking and they also asked something.\n8. is_repeat_of_previous is true when this message repeats the substance of the lead previous message (for example saying \"not sure\" again).\n9. language is the BCP-47 tag of the language the lead wrote in.\n10. unparseable is true only when nothing at all can be understood from the message.\n\nUse the extraction_hint on each slot. Follow it exactly."
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Validate Extraction",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const input = $('Workflow Input').first().json;\nlet applicable = [];\ntry { applicable = JSON.parse(input.applicable_slots_json || '[]'); } catch (e) { applicable = []; }\nconst byKey = {};\nfor (const s of applicable) { byKey[s.slot_key] = s; }\n\nconst raw = $input.first().json;\nconst parsed = (raw && typeof raw.output === 'object' && raw.output !== null) ? raw.output : raw;\n\nconst INTENTS = ['answering', 'question', 'request_human', 'booking_intent', 'decline_booking', 'chitchat', 'unclear'];\nconst intent = INTENTS.includes(parsed.intent) ? parsed.intent : 'unclear';\n\nfunction coerce(v) {\n  if (v === null || v === undefined) return null;\n  if (typeof v === 'object') return v;\n  if (typeof v === 'number' || typeof v === 'boolean') return v;\n  const s = String(v).trim();\n  try { return JSON.parse(s); } catch (e) { return s; }\n}\n\n// Contact details end up on the lead record and in the mailing list, so a value\n// that is not usable is dropped rather than stored: a wrong address looks like a\n// contactable lead and is worse than an empty column. Character classes, not\n// backslash escapes - a backslash does not reliably survive the JSON round trip\n// this source goes through on every edit.\nconst EMAIL_RE = /^[a-z0-9._%+-]+@[a-z0-9-]+([.][a-z0-9-]+)*[.][a-z]{2,}$/;\nconst PHONE_SHAPE_RE = /^[+()0-9 .-]+$/;\n\nfunction cleanEmail(rawValue) {\n  if (typeof rawValue !== 'string') return null;\n  const e = rawValue.trim().toLowerCase().replace(/^mailto:/, '');\n  if (e.length < 6 || e.length > 254) return null;\n  if (!EMAIL_RE.test(e)) return null;\n  if (e.split('@')[0].length > 64) return null;\n  return e;\n}\n\nfunction cleanPhone(rawValue) {\n  if (typeof rawValue !== 'string') return null;\n  const trimmed = rawValue.trim();\n  if (!PHONE_SHAPE_RE.test(trimmed)) return null;\n  const digits = trimmed.replace(/[^0-9]/g, '');\n  // ITU E.164 caps a number at 15 digits; 7 is the shortest usable one.\n  if (digits.length < 7 || digits.length > 15) return null;\n  return trimmed;\n}\n\nfunction sanitiseContact(v) {\n  if (!v || typeof v !== 'object' || Array.isArray(v)) return v;\n  const out = {};\n  if (typeof v.full_name === 'string' && v.full_name.trim().length > 0) out.full_name = v.full_name.trim();\n  const phone = cleanPhone(v.phone);\n  const email = cleanEmail(v.email);\n  if (phone) out.phone = phone;\n  if (email) out.email = email;\n  return out;\n}\n\nfunction isValid(def, v) {\n  const t = def.value_type;\n  if (t === 'enum') {\n    if (typeof v !== 'string' || v.length === 0) return false;\n    const choices = Array.isArray(def.choices) ? def.choices : null;\n    if (choices && choices.length) return choices.indexOf(v) !== -1;\n    return true;\n  }\n  if (t === 'text' || t === 'date') return typeof v === 'string' && v.length > 0;\n  if (t === 'number') return typeof v === 'number' && isFinite(v);\n  if (t === 'currency_range') {\n    if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;\n    return (typeof v.min === 'number' && isFinite(v.min)) || (typeof v.max === 'number' && isFinite(v.max));\n  }\n  if (t === 'contact') {\n    // sanitiseContact has already removed anything unusable, so a surviving\n    // phone or email key is enough. A name on its own does not count.\n    if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;\n    return typeof v.phone === 'string' || typeof v.email === 'string';\n  }\n  return false;\n}\n\nconst cleaned = [];\nconst rawSlots = Array.isArray(parsed.slots) ? parsed.slots : [];\nfor (const s of rawSlots) {\n  if (!s || typeof s.slot_key !== 'string') continue;\n  const def = byKey[s.slot_key];\n  if (!def) continue;\n  const conf = typeof s.confidence === 'number' ? s.confidence : 0;\n  if (conf < 0.6) continue;\n  let v = coerce(s.value_json !== undefined ? s.value_json : s.value);\n  if (def.value_type === 'currency_range' && v && typeof v === 'object' && !Array.isArray(v)) {\n    const norm = {};\n    if (typeof v.min === 'number') norm.min = v.min;\n    if (typeof v.max === 'number') norm.max = v.max;\n    norm.currency = (typeof v.currency === 'string' && v.currency) ? v.currency : 'AED';\n    // The band is widened by ten percent either side so the catalogue search has\n    // something to work with. That number is ours, not the lead's, and it must\n    // never be read back to them - stated_text is what a human sees.\n    if (typeof v.stated_text === 'string' && v.stated_text.trim()) norm.stated_text = v.stated_text.trim();\n    v = norm;\n  }\n  if (def.value_type === 'contact') v = sanitiseContact(v);\n  if (def.value_type === 'enum' && typeof v === 'number') v = String(v);\n  if (!isValid(def, v)) continue;\n  cleaned.push({ slot_key: s.slot_key, value: v, confidence: conf });\n}\n\nreturn [{ json: {\n  ok: true,\n  slots: cleaned,\n  intent: intent,\n  question_text: typeof parsed.question_text === 'string' ? parsed.question_text : '',\n  is_repeat_of_previous: parsed.is_repeat_of_previous === true,\n  language: (typeof parsed.language === 'string' && parsed.language) ? parsed.language : (input.language_hint || 'en'),\n  unparseable: parsed.unparseable === true || (cleaned.length === 0 && intent === 'unclear')\n} }];"
+      }
+    },
+    {
+      "name": "Return",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        940,
+        0
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ok",
+              "name": "ok",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "slots",
+              "name": "slots",
+              "value": "={{ $json.slots }}",
+              "type": "array"
+            },
+            {
+              "id": "intent",
+              "name": "intent",
+              "value": "={{ $json.intent }}",
+              "type": "string"
+            },
+            {
+              "id": "qt",
+              "name": "question_text",
+              "value": "={{ $json.question_text }}",
+              "type": "string"
+            },
+            {
+              "id": "rep",
+              "name": "is_repeat_of_previous",
+              "value": "={{ $json.is_repeat_of_previous }}",
+              "type": "boolean"
+            },
+            {
+              "id": "lang",
+              "name": "language",
+              "value": "={{ $json.language }}",
+              "type": "string"
+            },
+            {
+              "id": "unp",
+              "name": "unparseable",
+              "value": "={{ $json.unparseable }}",
+              "type": "boolean"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Return Extraction Failed",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        700,
+        220
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ok",
+              "name": "ok",
+              "value": false,
+              "type": "boolean"
+            },
+            {
+              "id": "err",
+              "name": "error",
+              "value": "extraction_failed",
+              "type": "string"
+            },
+            {
+              "id": "slots",
+              "name": "slots",
+              "value": "={{ [] }}",
+              "type": "array"
+            },
+            {
+              "id": "intent",
+              "name": "intent",
+              "value": "unclear",
+              "type": "string"
+            },
+            {
+              "id": "unp",
+              "name": "unparseable",
+              "value": true,
+              "type": "boolean"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Workflow Input": {
+      "main": [
+        [
+          {
+            "node": "Extract Facts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Facts": {
+      "main": [
+        [
+          {
+            "node": "Validate Extraction",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Return Extraction Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Extraction": {
+      "main": [
+        [
+          {
+            "node": "Return",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extraction Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Extract Facts",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fact Schema": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Extract Facts",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Fact Schema",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

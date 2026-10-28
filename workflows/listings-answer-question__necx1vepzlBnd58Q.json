@@ -1,0 +1,342 @@
+{
+  "name": "LQS - Listings: answer question",
+  "id": "necx1vepzlBnd58Q",
+  "active": true,
+  "versionId": "ed69024a-2e27-44e8-872a-21019ec0ce45",
+  "description": "In: conversation_id, question_text, language, market_id, filled_values_json. Out: { ok, answer_text, grounded, sources }. An AI Agent with exactly one tool (LQS - Listings: search) and no database write access. Ungrounded questions get the deflection sentence.",
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": true,
+    "errorWorkflow": "f2C3GiauR1vJiIxw"
+  },
+  "nodes": [
+    {
+      "name": "Workflow Input",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "conversation_id",
+              "type": "string"
+            },
+            {
+              "name": "question_text",
+              "type": "string"
+            },
+            {
+              "name": "language",
+              "type": "string"
+            },
+            {
+              "name": "market_id",
+              "type": "string"
+            },
+            {
+              "name": "filled_values_json",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Answer Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.1,
+      "position": [
+        280,
+        220
+      ],
+      "parameters": {
+        "modelName": "models/gemini-3.1-flash-lite",
+        "options": {
+          "temperature": 0
+        }
+      },
+      "credentials": {
+        "googlePalmApi": {
+          "id": "CREDENTIAL_ID",
+          "name": "googlePalmApi (set your own)"
+        }
+      }
+    },
+    {
+      "name": "Answer Retry Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.1,
+      "position": [
+        640,
+        360
+      ],
+      "parameters": {
+        "modelName": "models/gemini-3.1-flash-lite",
+        "options": {
+          "temperature": 0
+        }
+      },
+      "credentials": {
+        "googlePalmApi": {
+          "id": "CREDENTIAL_ID",
+          "name": "googlePalmApi (set your own)"
+        }
+      }
+    },
+    {
+      "name": "Answer Schema",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        600,
+        220
+      ],
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\"type\":\"object\",\"properties\":{\"answer_text\":{\"type\":\"string\"},\"grounded\":{\"type\":\"boolean\"},\"sources\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"answer_text\",\"grounded\",\"sources\"]}",
+        "autoFix": true
+      }
+    },
+    {
+      "name": "Listings_search",
+      "type": "@n8n/n8n-nodes-langchain.toolWorkflow",
+      "typeVersion": 2.2,
+      "position": [
+        440,
+        220
+      ],
+      "parameters": {
+        "description": "Search the off-plan project catalogue. Returns projects with developer, area, handover quarter, payment plan, resale threshold, gross yield estimate, bedrooms and price range. This is the only source of property facts. Call it before answering anything factual.",
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "RIrTl94qW1hkHG2d",
+          "cachedResultName": "LQS - Listings: search"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": [],
+          "value": {
+            "market_id": "={{ $('Workflow Input').item.json.market_id }}",
+            "budget_min": "={{ $fromAI('budget_min', 'Lower bound of the budget in AED. Use 0 when the lead has not given one.', 'number') }}",
+            "budget_max": "={{ $fromAI('budget_max', 'Upper bound of the budget in AED. Use 0 when the lead has not given one.', 'number') }}",
+            "bedrooms": "={{ $fromAI('bedrooms', 'Bedroom count as a string: 0 for studio, 1, 2, 3, 4. Empty string when it does not matter.', 'string') }}",
+            "area": "={{ $fromAI('area', 'Area key: downtown, marina, business_bay, dubai_hills, creek_harbour, jvc, dubai_south. Empty string for any area.', 'string') }}",
+            "handover_year": "={{ $fromAI('handover_year', 'Four digit handover year, for example 2027. Empty string for any year.', 'string') }}",
+            "developer": "={{ $fromAI('developer', 'Developer name, for example Emaar. Empty string for any developer.', 'string') }}",
+            "project_name": "={{ $fromAI('project_name', 'Project name to look up, for example Marina Vista. Empty string when not naming a project.', 'string') }}",
+            "limit": "={{ $fromAI('limit', 'How many rows to return, 1 to 5.', 'number') }}"
+          }
+        }
+      }
+    },
+    {
+      "name": "Answer From Catalogue",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        280,
+        0
+      ],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "promptType": "define",
+        "hasOutputParser": true,
+        "text": "=LEAD'S QUESTION:\n{{ $json.question_text }}\n\nWHAT WE ALREADY KNOW ABOUT THIS LEAD:\n{{ $json.filled_values_json }}\n\nREPLY LANGUAGE: {{ $json.language }}",
+        "options": {
+          "enableStreaming": false,
+          "maxIterations": 4,
+          "systemMessage": "You answer one factual question from a real-estate lead, using only rows returned by the Listings_search tool.\n\nAlways call Listings_search before you answer anything factual. Call it even when you think you know - you do not, the catalogue is the only source.\n\nHard rules:\n1. Never state a price, handover date, payment plan, resale threshold, yield, size or availability that is not present in a row the tool just returned.\n2. If the tool returns nothing relevant, say the agent will go through the current options with them. Never estimate, never infer, never fill a gap from general knowledge, never give a range you made up.\n3. Never tell the lead that there is nothing for them, that you have no properties, that nothing matches, or that the catalogue is empty. You are not looking at the whole book of stock and you must never imply that you are. An empty tool result means you could not find it, not that it does not exist.\n4. Never repeat the lead's budget back to them as a number or a range. The figures held against them are a search band the system worked out from what they said, not their own words. Say \"your budget\".\n5. Never predict future value, future price, capital appreciation or market direction. That is not in the catalogue, so it is not answerable. Deflect it.\n6. Never offer or suggest a meeting time, never claim a booking is made, never promise anything on the agent's behalf, never quote fees or commissions.\n7. Under 60 words. No bullet lists, no headings. Speak like a person in chat.\n8. Reply in the REPLY LANGUAGE given.\n9. Set grounded to true only when every fact in your answer came from a returned row. If you deflected, or if you had no rows, grounded is false.\n10. sources is the list of project_id values you used, or an empty array."
+        }
+      }
+    },
+    {
+      "name": "Shape Answer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const raw = $input.first().json;\nconst parsed = (raw && typeof raw.output === 'object' && raw.output !== null) ? raw.output : raw;\nconst deflection = 'I do not have that detail to hand, so the agent will go through the current options with you.';\n\nlet text = (typeof parsed.answer_text === 'string') ? parsed.answer_text.trim() : '';\nlet grounded = parsed.grounded === true;\n\nconst sources = Array.isArray(parsed.sources) ? parsed.sources.filter(function (s) { return typeof s === 'string' && s.length > 0; }) : [];\nif (grounded && sources.length === 0) { grounded = false; }\n\n// grounded used to be worked out here and then thrown away: whatever the model\n// wrote went to the lead word for word. That is how \"I currently do not have any\n// properties listed within your specified budget range\" was sent to a lead while\n// nine matching units sat in the catalogue. Nothing ungrounded is quotable.\nif (!grounded) { text = deflection; }\nif (!text) { text = deflection; grounded = false; }\n\nreturn [{ json: { ok: true, answer_text: text, grounded: grounded, sources: sources } }];"
+      }
+    },
+    {
+      "name": "Return",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1100,
+        0
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ok",
+              "name": "ok",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "at",
+              "name": "answer_text",
+              "value": "={{ $json.answer_text }}",
+              "type": "string"
+            },
+            {
+              "id": "g",
+              "name": "grounded",
+              "value": "={{ $json.grounded }}",
+              "type": "boolean"
+            },
+            {
+              "id": "src",
+              "name": "sources",
+              "value": "={{ $json.sources }}",
+              "type": "array"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Return Deflection",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        600,
+        -200
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ok",
+              "name": "ok",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "at",
+              "name": "answer_text",
+              "value": "I do not have that detail to hand, so the agent will confirm it for you in the meeting.",
+              "type": "string"
+            },
+            {
+              "id": "g",
+              "name": "grounded",
+              "value": false,
+              "type": "boolean"
+            },
+            {
+              "id": "src",
+              "name": "sources",
+              "value": "={{ [] }}",
+              "type": "array"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Workflow Input": {
+      "main": [
+        [
+          {
+            "node": "Answer From Catalogue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Answer From Catalogue": {
+      "main": [
+        [
+          {
+            "node": "Shape Answer",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Return Deflection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shape Answer": {
+      "main": [
+        [
+          {
+            "node": "Return",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Answer Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Answer From Catalogue",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Listings_search": {
+      "ai_tool": [
+        [
+          {
+            "node": "Answer From Catalogue",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Answer Schema": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Answer From Catalogue",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Answer Retry Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Answer Schema",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

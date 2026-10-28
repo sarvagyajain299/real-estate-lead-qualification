@@ -1,0 +1,455 @@
+{
+  "name": "LQS - Booking: confirm",
+  "id": "jHZl26o8Ra4xnWPh",
+  "active": true,
+  "versionId": "1d9877de-03fc-4c54-9c4f-ff9c56ab4d97",
+  "description": "Stateful, writes to Calendar and the database. In: conversation_id, chosen_slot_utc. Out: { ok, booking_id, calendar_event_id } or { ok:false, error:'slot_taken' }. Idempotent when the booking is already confirmed. MVP: no availability re-check before creating the event.",
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": true,
+    "errorWorkflow": "f2C3GiauR1vJiIxw"
+  },
+  "nodes": [
+    {
+      "name": "Workflow Input",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "conversation_id",
+              "type": "string"
+            },
+            {
+              "name": "chosen_slot_utc",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Load Offered Booking",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        240,
+        0
+      ],
+      "alwaysOutputData": true,
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "select b.id as booking_id, b.offered_slots as offered_slots, b.status as status, b.calendar_event_id as calendar_event_id, b.conversation_id as conversation_id, b.lead_id as lead_id, b.agent_id as agent_id, l.full_name as lead_name, l.email as lead_email, l.phone as lead_phone, l.timezone as lead_tz, a.calendar_id as calendar_id, a.email as agent_email, a.full_name as agent_name, a.timezone as agent_tz, m.timezone as market_tz from lqs.bookings b join lqs.leads l on l.id = b.lead_id join lqs.agents a on a.id = b.agent_id join lqs.conversations c on c.id = b.conversation_id join lqs.markets m on m.id = c.market_id where b.conversation_id = $1::uuid and b.status in ('offered', 'confirmed') order by b.created_at desc limit 1;",
+        "options": {
+          "queryReplacement": "={{ [$json.conversation_id] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "CREDENTIAL_ID",
+          "name": "postgres (set your own)"
+        }
+      }
+    },
+    {
+      "name": "Validate Chosen Slot",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const input = $('Workflow Input').first().json;\nconst rows = $input.all().map(function (i) { return i.json; }).filter(function (r) { return r && r.booking_id; });\n\nif (rows.length === 0) {\n  return [{ json: { outcome: 'not_found', booking_id: '', calendar_event_id: '' } }];\n}\n\nconst b = rows[0];\n\nif (b.status === 'confirmed') {\n  return [{ json: { outcome: 'already', booking_id: b.booking_id, calendar_event_id: b.calendar_event_id || '' } }];\n}\n\nconst chosenIso = String(input.chosen_slot_utc || '').trim();\nconst chosen = chosenIso ? DateTime.fromISO(chosenIso).toUTC() : null;\nif (!chosen || !chosen.isValid) {\n  return [{ json: { outcome: 'taken', booking_id: b.booking_id, calendar_event_id: '' } }];\n}\n\nconst offered = Array.isArray(b.offered_slots) ? b.offered_slots : [];\nlet match = null;\nfor (const s of offered) {\n  const t = DateTime.fromISO(String(s.starts_at_utc || '')).toUTC();\n  if (t.isValid && Math.abs(t.toMillis() - chosen.toMillis()) < 60000) { match = s; break; }\n}\nif (!match) {\n  return [{ json: { outcome: 'taken', booking_id: b.booking_id, calendar_event_id: '' } }];\n}\n\nconst start = DateTime.fromISO(match.starts_at_utc).toUTC();\nconst end = match.ends_at_utc ? DateTime.fromISO(match.ends_at_utc).toUTC() : start.plus({ minutes: 60 });\nconst agentTz = b.agent_tz || b.market_tz || 'Asia/Dubai';\nconst agentLabel = start.setZone(agentTz).toFormat('ccc d LLL yyyy, h:mm a');\n\nconst description = 'Off-plan consultation booked by the qualification bot.' +\n  '\\nLead: ' + (b.lead_name || 'not given') +\n  '\\nPhone: ' + (b.lead_phone || 'not given') +\n  '\\nEmail: ' + (b.lead_email || 'not given') +\n  '\\nStarts (' + agentTz + '): ' + agentLabel +\n  '\\n\\nThe qualification brief will be added here shortly.';\n\nreturn [{ json: {\n  outcome: 'create',\n  booking_id: b.booking_id,\n  conversation_id: b.conversation_id,\n  calendar_id: b.calendar_id || 'primary',\n  start_iso: start.toISO(),\n  end_iso: end.toISO(),\n  summary: 'Consultation - ' + (b.lead_name || 'new lead'),\n  description: description,\n  calendar_event_id: ''\n} }];"
+      }
+    },
+    {
+      "name": "Route Outcome",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        720,
+        0
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "outputKey": "create",
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.outcome }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "create"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "outputKey": "already",
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.outcome }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "already"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "outputKey": "not_found",
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.outcome }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "not_found"
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "taken"
+        }
+      }
+    },
+    {
+      "name": "Create Calendar Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        960,
+        -240
+      ],
+      "parameters": {
+        "resource": "event",
+        "operation": "create",
+        "calendar": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $json.calendar_id }}"
+        },
+        "start": "={{ $json.start_iso }}",
+        "end": "={{ $json.end_iso }}",
+        "useDefaultReminders": true,
+        "additionalFields": {
+          "summary": "={{ $json.summary }}",
+          "description": "={{ $json.description }}",
+          "showMeAs": "opaque",
+          "sendUpdates": "none"
+        }
+      },
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "CREDENTIAL_ID",
+          "name": "googleCalendarOAuth2Api (set your own)"
+        }
+      }
+    },
+    {
+      "name": "Confirm Booking Rows",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1200,
+        -240
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "with upd as (update lqs.bookings set status = 'confirmed', starts_at = $2::timestamptz, ends_at = $3::timestamptz, calendar_event_id = $4 where id = $1::uuid returning id, conversation_id, lead_id), uc as (update lqs.conversations set status = 'booked', updated_at = now() where id = (select conversation_id from upd) returning id), ul as (update lqs.leads set status = 'booked', updated_at = now() where id = (select lead_id from upd) returning id) select (select id from upd) as booking_id, $4 as calendar_event_id;",
+        "options": {
+          "queryReplacement": "={{ [$('Validate Chosen Slot').item.json.booking_id, $('Validate Chosen Slot').item.json.start_iso, $('Validate Chosen Slot').item.json.end_iso, $json.id] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "CREDENTIAL_ID",
+          "name": "postgres (set your own)"
+        }
+      }
+    },
+    {
+      "name": "Return",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1440,
+        -240
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ok",
+              "name": "ok",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "bid",
+              "name": "booking_id",
+              "value": "={{ $json.booking_id }}",
+              "type": "string"
+            },
+            {
+              "id": "eid",
+              "name": "calendar_event_id",
+              "value": "={{ $json.calendar_event_id }}",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Return Already Confirmed",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        960,
+        -40
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ok",
+              "name": "ok",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "bid",
+              "name": "booking_id",
+              "value": "={{ $json.booking_id }}",
+              "type": "string"
+            },
+            {
+              "id": "eid",
+              "name": "calendar_event_id",
+              "value": "={{ $json.calendar_event_id }}",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Return Not Found",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        960,
+        160
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ok",
+              "name": "ok",
+              "value": false,
+              "type": "boolean"
+            },
+            {
+              "id": "err",
+              "name": "error",
+              "value": "not_found",
+              "type": "string"
+            },
+            {
+              "id": "bid",
+              "name": "booking_id",
+              "value": "",
+              "type": "string"
+            },
+            {
+              "id": "eid",
+              "name": "calendar_event_id",
+              "value": "",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Return Slot Taken",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        960,
+        360
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ok",
+              "name": "ok",
+              "value": false,
+              "type": "boolean"
+            },
+            {
+              "id": "err",
+              "name": "error",
+              "value": "slot_taken",
+              "type": "string"
+            },
+            {
+              "id": "bid",
+              "name": "booking_id",
+              "value": "={{ $json.booking_id }}",
+              "type": "string"
+            },
+            {
+              "id": "eid",
+              "name": "calendar_event_id",
+              "value": "",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Workflow Input": {
+      "main": [
+        [
+          {
+            "node": "Load Offered Booking",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Offered Booking": {
+      "main": [
+        [
+          {
+            "node": "Validate Chosen Slot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Chosen Slot": {
+      "main": [
+        [
+          {
+            "node": "Route Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Outcome": {
+      "main": [
+        [
+          {
+            "node": "Create Calendar Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Return Already Confirmed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Return Not Found",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Return Slot Taken",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Calendar Event": {
+      "main": [
+        [
+          {
+            "node": "Confirm Booking Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confirm Booking Rows": {
+      "main": [
+        [
+          {
+            "node": "Return",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

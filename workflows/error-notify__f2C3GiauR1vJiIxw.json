@@ -1,0 +1,62 @@
+{
+  "name": "LQS - Error: notify",
+  "id": "f2C3GiauR1vJiIxw",
+  "active": true,
+  "versionId": "5163b5e9-df08-4101-8d5b-d74557a0372b",
+  "description": "Error workflow for the lead qualification system. Telegrams the operator with workflow name, execution id, last node, conversation id (if set as custom data) and the error message.",
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": true
+  },
+  "nodes": [
+    {
+      "id": "8de41e12-5be1-4c6b-a23d-d23de39c45b9",
+      "name": "On Workflow Error",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "325a7b33-f3c3-4575-8ed1-9ffb848313e8",
+      "name": "Telegram Operator",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "TELEGRAM_CHAT_ID",
+        "text": "=Workflow failed\nWorkflow: {{ ($json.workflow?.name || \"unknown\").toString().replaceAll(\"&\",\"&amp;\").replaceAll(\"<\",\"&lt;\").replaceAll(\">\",\"&gt;\") }}\nExecution: {{ $json.execution?.id || \"unknown\" }}\nLast node: {{ ($json.execution?.lastNodeExecuted || \"unknown\").toString().replaceAll(\"&\",\"&amp;\").replaceAll(\"<\",\"&lt;\").replaceAll(\">\",\"&gt;\") }}\nConversation: {{ $json.execution?.customData?.conversation_id || \"unknown\" }}\nError: {{ ($json.execution?.error?.message || \"no message\").toString().slice(0,600).replaceAll(\"&\",\"&amp;\").replaceAll(\"<\",\"&lt;\").replaceAll(\">\",\"&gt;\") }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "CREDENTIAL_ID",
+          "name": "telegramApi (set your own)"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "On Workflow Error": {
+      "main": [
+        [
+          {
+            "node": "Telegram Operator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

@@ -1,0 +1,155 @@
+{
+  "name": "LQS - Lead: resolve identity",
+  "id": "sC0lt9OPiKgENGAz",
+  "active": true,
+  "versionId": "62b4d63c-ebed-457b-abe9-a0247c45237a",
+  "description": "Stateful. In: channel, external_id, display_name, market_code. Out: { ok, lead_id, conversation_id, market_id, deal_type, language, bot_muted }. Finds the lead identity or creates lead + identity + conversation, and reuses the lead's active conversation (creating one if the last is closed).",
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": true,
+    "errorWorkflow": "f2C3GiauR1vJiIxw"
+  },
+  "nodes": [
+    {
+      "id": "b4e7fe83-5209-4d7c-ad3a-468d18d470d6",
+      "name": "Workflow Input",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "channel",
+              "type": "string"
+            },
+            {
+              "name": "external_id",
+              "type": "string"
+            },
+            {
+              "name": "display_name",
+              "type": "string"
+            },
+            {
+              "name": "market_code",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "48291f50-2b47-4dc3-a933-b8ae9ad97209",
+      "name": "Resolve Lead And Conversation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        240,
+        0
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "with m as (select id, default_language from lqs.markets where code = $4 and active limit 1), existing as (select li.lead_id from lqs.lead_identities li where li.channel = $1 and li.external_id = $2), new_lead as (insert into lqs.leads (market_id, full_name, source, status) select m.id, nullif($3, ''), $1, 'new' from m where not exists (select 1 from existing) returning id), lead_row as (select lead_id as id from existing union all select id from new_lead), new_identity as (insert into lqs.lead_identities (lead_id, channel, external_id, display_name) select lead_row.id, $1, $2, nullif($3, '') from lead_row where not exists (select 1 from existing) on conflict (channel, external_id) do nothing returning lead_id), existing_conv as (select c.* from lqs.conversations c, lead_row where c.lead_id = lead_row.id and c.status <> 'closed' order by c.created_at desc limit 1), new_conv as (insert into lqs.conversations (lead_id, market_id, deal_type, channel, status) select lead_row.id, m.id, 'offplan', $1, 'active' from lead_row, m where not exists (select 1 from existing_conv) returning *), conv as (select * from existing_conv union all select * from new_conv) select true as ok, conv.lead_id as lead_id, conv.id as conversation_id, conv.market_id as market_id, conv.deal_type as deal_type, coalesce(conv.language, m.default_language) as language, conv.bot_muted as bot_muted from conv, m;",
+        "options": {
+          "queryReplacement": "={{ [$json.channel, $json.external_id, $json.display_name || \"\", $json.market_code || \"AE\"] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "CREDENTIAL_ID",
+          "name": "postgres (set your own)"
+        }
+      }
+    },
+    {
+      "id": "9323ddfe-5855-44e6-95e0-ba1951cf6287",
+      "name": "Return",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        480,
+        0
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ok",
+              "name": "ok",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "lead",
+              "name": "lead_id",
+              "value": "={{ $json.lead_id }}",
+              "type": "string"
+            },
+            {
+              "id": "conv",
+              "name": "conversation_id",
+              "value": "={{ $json.conversation_id }}",
+              "type": "string"
+            },
+            {
+              "id": "market",
+              "name": "market_id",
+              "value": "={{ $json.market_id }}",
+              "type": "string"
+            },
+            {
+              "id": "deal",
+              "name": "deal_type",
+              "value": "={{ $json.deal_type }}",
+              "type": "string"
+            },
+            {
+              "id": "lang",
+              "name": "language",
+              "value": "={{ $json.language }}",
+              "type": "string"
+            },
+            {
+              "id": "muted",
+              "name": "bot_muted",
+              "value": "={{ $json.bot_muted }}",
+              "type": "boolean"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Workflow Input": {
+      "main": [
+        [
+          {
+            "node": "Resolve Lead And Conversation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Lead And Conversation": {
+      "main": [
+        [
+          {
+            "node": "Return",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

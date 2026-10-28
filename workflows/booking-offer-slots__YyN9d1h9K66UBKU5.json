@@ -1,0 +1,345 @@
+{
+  "name": "LQS - Booking: offer slots",
+  "id": "YyN9d1h9K66UBKU5",
+  "active": true,
+  "versionId": "b7951bed-63c6-48d5-badc-308573d831b4",
+  "description": "In: conversation_id, agent_id. Out: { ok, booking_id, slots } or { ok:false, error:'no_slots' }. Reads the agent calendar, filters to market working hours in market time, picks three slots on different days, renders labels in the lead timezone and writes the bookings row.",
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": true,
+    "errorWorkflow": "f2C3GiauR1vJiIxw"
+  },
+  "nodes": [
+    {
+      "name": "Workflow Input",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "conversation_id",
+              "type": "string"
+            },
+            {
+              "name": "agent_id",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Load Booking Context",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        240,
+        0
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "select c.id as conversation_id, c.lead_id as lead_id, l.timezone as lead_tz, l.full_name as lead_name, m.timezone as market_tz, m.working_hours as working_hours, m.min_notice_hours as min_notice_hours, m.booking_window_days as booking_window_days, a.id as agent_id, a.calendar_id as calendar_id, a.timezone as agent_tz, a.full_name as agent_name from lqs.conversations c join lqs.markets m on m.id = c.market_id join lqs.leads l on l.id = c.lead_id cross join lateral (select ag.* from lqs.agents ag where ag.active and ag.market_id = c.market_id and (nullif($2, '') is null or ag.id = nullif($2, '')::uuid) order by ag.created_at limit 1) a where c.id = $1::uuid;",
+        "options": {
+          "queryReplacement": "={{ [$json.conversation_id, $json.agent_id || ''] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "CREDENTIAL_ID",
+          "name": "postgres (set your own)"
+        }
+      }
+    },
+    {
+      "name": "Load Agent Calendar",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        480,
+        0
+      ],
+      "alwaysOutputData": true,
+      "parameters": {
+        "resource": "event",
+        "operation": "getAll",
+        "calendar": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $json.calendar_id }}"
+        },
+        "returnAll": true,
+        "timeMin": "={{ $now.plus({ hours: $json.min_notice_hours }).toISO() }}",
+        "timeMax": "={{ $now.plus({ days: $json.booking_window_days }).toISO() }}",
+        "options": {
+          "singleEvents": true,
+          "orderBy": "startTime",
+          "showDeleted": false
+        }
+      },
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "CREDENTIAL_ID",
+          "name": "googleCalendarOAuth2Api (set your own)"
+        }
+      }
+    },
+    {
+      "name": "Pick Free Slots",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const ctx = $('Load Booking Context').first().json;\nconst events = $input.all().map(function (i) { return i.json; }).filter(function (e) { return e && e.start; });\n\nconst marketTz = ctx.market_tz || 'Asia/Dubai';\nconst leadTz = ctx.lead_tz || marketTz;\nconst wh = ctx.working_hours || {};\nconst minNotice = Number(ctx.min_notice_hours || 3);\nconst windowDays = Number(ctx.booking_window_days || 7);\nconst durationMin = 60;\n\nconst nowUtc = DateTime.utc();\nconst startBound = nowUtc.plus({ hours: minNotice });\nconst endBound = nowUtc.plus({ days: windowDays });\n\nconst busy = [];\nfor (const e of events) {\n  if (e.status === 'cancelled') continue;\n  const s = e.start ? (e.start.dateTime || e.start.date) : null;\n  const en = e.end ? (e.end.dateTime || e.end.date) : null;\n  if (!s || !en) continue;\n  busy.push({ s: DateTime.fromISO(s).toUTC(), e: DateTime.fromISO(en).toUTC() });\n}\n\nconst dayKeys = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];\nconst candidates = [];\nlet cursor = startBound.setZone(marketTz).startOf('day');\nconst lastDay = endBound.setZone(marketTz).endOf('day');\n\nwhile (cursor <= lastDay) {\n  const key = dayKeys[cursor.weekday % 7];\n  const hours = wh[key];\n  if (Array.isArray(hours) && hours.length === 2 && hours[0] && hours[1]) {\n    const openParts = String(hours[0]).split(':');\n    const closeParts = String(hours[1]).split(':');\n    let slot = cursor.set({ hour: Number(openParts[0]), minute: Number(openParts[1] || 0), second: 0, millisecond: 0 });\n    const close = cursor.set({ hour: Number(closeParts[0]), minute: Number(closeParts[1] || 0), second: 0, millisecond: 0 });\n    while (slot.plus({ minutes: durationMin }) <= close) {\n      const sUtc = slot.toUTC();\n      const eUtc = sUtc.plus({ minutes: durationMin });\n      if (sUtc >= startBound && sUtc <= endBound) {\n        let clash = false;\n        for (const b of busy) { if (sUtc < b.e && b.s < eUtc) { clash = true; break; } }\n        if (!clash) candidates.push(sUtc);\n      }\n      slot = slot.plus({ minutes: durationMin });\n    }\n  }\n  cursor = cursor.plus({ days: 1 });\n}\n\nconst byDay = {};\nfor (const c of candidates) {\n  const k = c.setZone(marketTz).toFormat('yyyy-LL-dd');\n  if (!byDay[k]) byDay[k] = [];\n  byDay[k].push(c);\n}\nconst days = Object.keys(byDay).sort();\nconst chosen = [];\nfor (const d of days) {\n  if (chosen.length >= 3) break;\n  chosen.push(byDay[d][0]);\n}\nif (chosen.length < 3) {\n  for (const d of days) {\n    for (const c of byDay[d]) {\n      if (chosen.length >= 3) break;\n      let dup = false;\n      for (const x of chosen) { if (x.toMillis() === c.toMillis()) { dup = true; break; } }\n      if (!dup) chosen.push(c);\n    }\n    if (chosen.length >= 3) break;\n  }\n}\nchosen.sort(function (a, b) { return a.toMillis() - b.toMillis(); });\n\nconst slots = chosen.map(function (c) {\n  return {\n    starts_at_utc: c.toISO(),\n    ends_at_utc: c.plus({ minutes: durationMin }).toISO(),\n    label_local: c.setZone(leadTz).toFormat('ccc d LLL, h:mm a')\n  };\n});\n\nreturn [{ json: {\n  ok: slots.length > 0,\n  slots: slots,\n  slots_json: JSON.stringify(slots),\n  conversation_id: ctx.conversation_id,\n  lead_id: ctx.lead_id,\n  agent_id: ctx.agent_id\n} }];"
+      }
+    },
+    {
+      "name": "Has Free Slots",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        960,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.ok }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "name": "Record Offer",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1200,
+        -140
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "insert into lqs.bookings (conversation_id, lead_id, agent_id, status, offered_slots) values ($1::uuid, $2::uuid, $3::uuid, 'offered', $4::jsonb) returning id as booking_id;",
+        "options": {
+          "queryReplacement": "={{ [$json.conversation_id, $json.lead_id, $json.agent_id, $json.slots_json] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "CREDENTIAL_ID",
+          "name": "postgres (set your own)"
+        }
+      }
+    },
+    {
+      "name": "Record No Slots",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1200,
+        140
+      ],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "insert into lqs.bookings (conversation_id, lead_id, agent_id, status, offered_slots) values ($1::uuid, $2::uuid, $3::uuid, 'no_slots', '[]'::jsonb) returning id as booking_id;",
+        "options": {
+          "queryReplacement": "={{ [$json.conversation_id, $json.lead_id, $json.agent_id] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "CREDENTIAL_ID",
+          "name": "postgres (set your own)"
+        }
+      }
+    },
+    {
+      "name": "Return",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1440,
+        -140
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ok",
+              "name": "ok",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "bid",
+              "name": "booking_id",
+              "value": "={{ $json.booking_id }}",
+              "type": "string"
+            },
+            {
+              "id": "slots",
+              "name": "slots",
+              "value": "={{ $('Pick Free Slots').item.json.slots }}",
+              "type": "array"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Return No Slots",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1440,
+        140
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ok",
+              "name": "ok",
+              "value": false,
+              "type": "boolean"
+            },
+            {
+              "id": "err",
+              "name": "error",
+              "value": "no_slots",
+              "type": "string"
+            },
+            {
+              "id": "bid",
+              "name": "booking_id",
+              "value": "={{ $json.booking_id }}",
+              "type": "string"
+            },
+            {
+              "id": "slots",
+              "name": "slots",
+              "value": "={{ [] }}",
+              "type": "array"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Workflow Input": {
+      "main": [
+        [
+          {
+            "node": "Load Booking Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Booking Context": {
+      "main": [
+        [
+          {
+            "node": "Load Agent Calendar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Agent Calendar": {
+      "main": [
+        [
+          {
+            "node": "Pick Free Slots",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick Free Slots": {
+      "main": [
+        [
+          {
+            "node": "Has Free Slots",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Free Slots": {
+      "main": [
+        [
+          {
+            "node": "Record Offer",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record No Slots",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Offer": {
+      "main": [
+        [
+          {
+            "node": "Return",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record No Slots": {
+      "main": [
+        [
+          {
+            "node": "Return No Slots",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
